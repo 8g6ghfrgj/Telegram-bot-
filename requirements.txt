@@ -1,5 +1,4 @@
 python-telegram-bot==20.7
 telethon==1.34.0
 sqlite3
-python-dotenv
 aiohttp
