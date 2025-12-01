@@ -32,12 +32,14 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
 from telethon.errors import SessionPasswordNeededError
 
-# تكوين البوت - قراءة التوكن من متغير البيئة
+# توكن البوت - يأتي من متغير البيئة
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
-# التحقق من وجود التوكن
+# إذا لم يوجد توكن، توقف
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN غير موجود. يرجى تعيينه في متغيرات البيئة على Render.com")
+    print("❌ خطأ: لم يتم تعيين BOT_TOKEN في متغيرات البيئة")
+    print("⚠️  يرجى إضافة BOT_TOKEN في Render.com → Environment")
+    exit(1)
 
 # إعدادات قاعدة البيانات
 DB_NAME = "bot_database.db"
@@ -2016,11 +2018,11 @@ class BotHandler:
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.setup_handlers()
         
-        # إضافة المشرف الرئيسي (تعديل هنا لأي ID تريده)
+        # إضافة مشرف رئيسي - غير هذا الرقم إلى ID الخاص بك!
         self.db.add_admin(8390377822, "@user", "المشرف الرئيسي", True)
         
         print("🤖 البوت يعمل الآن...")
-        print("✅ تم إضافة الآيدي 8390377822 كمشرف رئيسي")
+        print(f"✅ تم إضافة الآيدي 8390377822 كمشرف رئيسي")
         print("🎯 البوت جاهز بنسبة 100%")
         
         self.application.run_polling()
