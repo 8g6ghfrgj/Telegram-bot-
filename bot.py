@@ -36,23 +36,16 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors import SessionPasswordNeededError
 
 # ===== تكوين البوت =====
-# قراءة التوكن من متغير البيئة أو من ملف .env
-BOT_TOKEN = os.environ.get('8500469877:AAGCNojz50p2U2RJrQ85TEGuuR4b-S7XaLo')
-if not BOT_TOKEN:
-    # محاولة قراءة من ملف .env إذا كان محلياً
-    try:
-        with open('.env', 'r') as f:
-            for line in f:
-                if line.startswith('BOT_TOKEN='):
-                    BOT_TOKEN = line.split('=')[1].strip()
-                    break
-    except:
-        pass
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
 if not BOT_TOKEN:
     print("❌ خطأ: BOT_TOKEN غير موجود!")
-    print("يرجى إضافته في ملف .env أو متغيرات البيئة")
+    print("🔧 الحل: أضف متغير بيئة في Render.com")
+    print("📝 اسم المتغير: BOT_TOKEN")
+    print("🔑 القيمة: 8500469877:AAGCNojz50p2U2RJrQ85TEGuuR4b-S7XaLo")
     exit(1)
+
+print("🤖 بدء تشغيل بوت تلجرام...")
 
 # ===== إعدادات قاعدة البيانات =====
 DB_NAME = "bot_database.db"
