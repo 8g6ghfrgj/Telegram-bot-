@@ -1072,11 +1072,13 @@ class BotHandler:
                 await query.edit_message_text(
                     f"📞 **إضافة جهة اتصال**\n\n"
                     f"يرجى إرسال ملف جهة الاتصال (VCF):\n\n"
+                    f"يمكنك إرسال جهة اتصال من زر 'جهة اتصال' في التليجرام\n\n"
                     f"أو أرسل /cancel للإلغاء",
                     parse_mode='Markdown'
                 )
                 user_context['conversation_active'] = True
                 context.user_data['ad_type'] = ad_type
+                context.user_data['conversation_active'] = True
                 return ADD_AD_MEDIA
             else:
                 # لأنواع الإعلانات الأخرى، نطلب النص أولاً
@@ -1093,6 +1095,7 @@ class BotHandler:
                 )
                 user_context['conversation_active'] = True
                 context.user_data['ad_type'] = ad_type
+                context.user_data['conversation_active'] = True
                 return ADD_AD_TEXT
         
         # إدارة المجموعات
@@ -1379,6 +1382,7 @@ class BotHandler:
         file_id = None
         file_type = None
         file_name = None
+        mime_type = None
         
         # التحقق من نوع الملف المرسل
         if update.message.photo:
@@ -1388,8 +1392,46 @@ class BotHandler:
             file_id = update.message.document.file_id
             file_type = 'document'
             file_name = update.message.document.file_name
-        else:
-            await update.message.reply_text("❌ يرجى إرسال صورة أو ملف VCF")
+            mime_type = update.message.document.mime_type
+        elif update.message.contact:
+            # جهة اتصال مباشرة (ليست ملف VCF)
+            # في هذه الحالة، سنقوم بإنشاء ملف VCF من بيانات جهة الاتصال
+            contact = update.message.contact
+            vcf_content = self.create_vcf_from_contact(contact)
+            
+            if vcf_content:
+                try:
+                    os.makedirs("ads", exist_ok=True)
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    file_path = f"ads/contact_{timestamp}.vcf"
+                    
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(vcf_content)
+                    
+                    success = self.db.add_ad('contact', None, file_path, 'contact', admin_id)
+                    if success:
+                        await update.message.reply_text("✅ تم إضافة جهة الاتصال بنجاح")
+                    else:
+                        await update.message.reply_text("❌ فشل إضافة جهة الاتصال")
+                    
+                    user_context['conversation_active'] = False
+                    context.user_data['conversation_active'] = False
+                    await self.start(update, context)
+                    return ConversationHandler.END
+                except Exception as e:
+                    logger.error(f"خطأ في حفظ جهة الاتصال: {str(e)}")
+                    await update.message.reply_text("❌ حدث خطأ أثناء حفظ جهة الاتصال")
+                    user_context['conversation_active'] = False
+                    context.user_data['conversation_active'] = False
+                    await self.start(update, context)
+                    return ConversationHandler.END
+            else:
+                await update.message.reply_text("❌ فشل إنشاء ملف VCF من جهة الاتصال")
+                return ADD_AD_MEDIA
+        
+        # إذا لم يكن هناك ملف
+        if not file_id and not update.message.contact:
+            await update.message.reply_text("❌ يرجى إرسال صورة أو ملف VCF أو جهة اتصال")
             return ADD_AD_MEDIA
         
         if file_id:
@@ -1402,8 +1444,30 @@ class BotHandler:
                 if file_type == 'photo':
                     file_path = f"ads/photo_{timestamp}.jpg"
                 elif file_type == 'document':
-                    # تحديد نوع الملف بناءً على الاسم
+                    # تحديد نوع الملف بناءً على الاسم والمحتوى
+                    is_vcf = False
+                    
+                    # التحقق من الامتداد
                     if file_name and file_name.lower().endswith(('.vcf', '.vcard')):
+                        is_vcf = True
+                    
+                    # التحقق من MIME type
+                    if mime_type and 'vcard' in mime_type.lower():
+                        is_vcf = True
+                    
+                    # التحقق من المحتوى (قراءة أول 100 بايت)
+                    try:
+                        temp_path = f"temp_{timestamp}.bin"
+                        await file.download_to_drive(temp_path)
+                        with open(temp_path, 'rb') as f:
+                            content_start = f.read(100).decode('utf-8', errors='ignore')
+                            if 'BEGIN:VCARD' in content_start.upper():
+                                is_vcf = True
+                        os.remove(temp_path)
+                    except:
+                        pass
+                    
+                    if is_vcf:
                         file_path = f"ads/contact_{timestamp}.vcf"
                         ad_type = 'contact'  # تأكيد أنه ملف اتصال
                     else:
@@ -1441,6 +1505,40 @@ class BotHandler:
         context.user_data['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
+    
+    def create_vcf_from_contact(self, contact):
+        """إنشاء ملف VCF من بيانات جهة الاتصال"""
+        try:
+            vcf_lines = []
+            vcf_lines.append("BEGIN:VCARD")
+            vcf_lines.append("VERSION:3.0")
+            
+            # الاسم
+            full_name = ""
+            if contact.first_name:
+                full_name += contact.first_name
+            if contact.last_name:
+                full_name += " " + contact.last_name
+            
+            if full_name.strip():
+                vcf_lines.append(f"FN:{full_name.strip()}")
+                if contact.first_name:
+                    vcf_lines.append(f"N:{contact.last_name or ''};{contact.first_name};;;")
+            
+            # رقم الهاتف
+            if contact.phone_number:
+                vcf_lines.append(f"TEL;TYPE=CELL:{contact.phone_number}")
+            
+            # معرف المستخدم (إذا كان متاحاً)
+            if contact.user_id:
+                vcf_lines.append(f"X-TELEGRAM-ID:{contact.user_id}")
+            
+            vcf_lines.append("END:VCARD")
+            
+            return "\n".join(vcf_lines)
+        except Exception as e:
+            logger.error(f"خطأ في إنشاء VCF: {str(e)}")
+            return None
     
     async def show_ads(self, query, context):
         """عرض الإعلانات"""
@@ -2084,12 +2182,16 @@ class BotHandler:
         )
         self.application.add_handler(add_account_conv)
         
-        # معالج الإعلانات - تم إصلاحه تماماً
+        # معالج الإعلانات - تم إصلاحه تماماً ليدعم جميع أنواع جهات الاتصال
         add_ad_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.handle_callback, pattern="^ad_type_")],
             states={
                 ADD_AD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_ad_text)],
-                ADD_AD_MEDIA: [MessageHandler(filters.PHOTO | filters.Document.ALL, self.add_ad_media)]
+                ADD_AD_MEDIA: [
+                    MessageHandler(filters.PHOTO, self.add_ad_media),
+                    MessageHandler(filters.Document.ALL, self.add_ad_media),
+                    MessageHandler(filters.CONTACT, self.add_ad_media)
+                ]
             },
             fallbacks=[CommandHandler("cancel", self.cancel)]
         )
@@ -2171,6 +2273,10 @@ class BotHandler:
         print("🎯 البوت جاهز بنسبة 100%")
         print("✅ جميع المشاكل تم إصلاحها")
         print("📢 إدارة الإعلانات تعمل بشكل كامل")
+        print("📞 جهات الاتصال تعمل الآن بشكل صحيح:")
+        print("   ✅ يدعم ملفات VCF")
+        print("   ✅ يدعم جهات الاتصال المباشرة")
+        print("   ✅ يدعم زر 'جهة اتصال' في التليجرام")
         print("👥 إدارة الحسابات تعمل بشكل كامل")
         print("💬 إدارة الردود تعمل بشكل كامل")
         print("👨‍💼 إدارة المشرفين تعمل بشكل كامل")
