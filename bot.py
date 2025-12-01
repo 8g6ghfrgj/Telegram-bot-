@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from threading import Thread
 from queue import Queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import vobject  # مكتبة لمعالجة ملفات VCF
 
 from telegram import (
     Update, 
@@ -32,6 +33,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.errors import SessionPasswordNeededError
+from telethon.tl.types import InputMediaContact, InputPhoneContact
 
 # خادم HTTP بسيط لمشكلة Port
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -109,6 +111,7 @@ class BotDatabase:
                 text TEXT,
                 media_path TEXT,
                 file_type TEXT,
+                contact_data TEXT,  # بيانات جهة الاتصال (JSON)
                 added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
                 admin_id INTEGER DEFAULT 0
             )
@@ -264,16 +267,16 @@ class BotDatabase:
         conn.close()
         return True
     
-    def add_ad(self, ad_type, text=None, media_path=None, file_type=None, admin_id=0):
+    def add_ad(self, ad_type, text=None, media_path=None, file_type=None, contact_data=None, admin_id=0):
         """إضافة إعلان"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
         try:
             cursor.execute('''
-                INSERT INTO ads (type, text, media_path, file_type, admin_id)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (ad_type, text, media_path, file_type, admin_id))
+                INSERT INTO ads (type, text, media_path, file_type, contact_data, admin_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (ad_type, text, media_path, file_type, contact_data, admin_id))
             
             conn.commit()
             return True
@@ -617,6 +620,47 @@ class TelegramBotManager:
                     logger.error(f"خطأ في الحساب {name}: {str(e)}")
                     continue
     
+    def parse_vcf_file(self, file_path):
+        """تحليل ملف VCF واستخراج بيانات جهة الاتصال"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                vcf_content = f.read()
+            
+            # استخدام مكتبة vobject لتحليل ملف VCF
+            vcard = vobject.readOne(vcf_content)
+            
+            contact_data = {
+                'first_name': '',
+                'last_name': '',
+                'phone_number': '',
+                'vcf_content': vcf_content  # حفظ المحتوى الأصلي أيضاً
+            }
+            
+            # استخراج الاسم
+            if hasattr(vcard, 'fn'):
+                full_name = str(vcard.fn.value)
+                # محاولة تقسيم الاسم الكامل إلى اسم أول واسم أخير
+                name_parts = full_name.split()
+                if len(name_parts) >= 2:
+                    contact_data['first_name'] = name_parts[0]
+                    contact_data['last_name'] = ' '.join(name_parts[1:])
+                else:
+                    contact_data['first_name'] = full_name
+            
+            # استخراج رقم الهاتف
+            if hasattr(vcard, 'tel'):
+                if isinstance(vcard.tel, list):
+                    for tel in vcard.tel:
+                        contact_data['phone_number'] = str(tel.value)
+                        break
+                else:
+                    contact_data['phone_number'] = str(vcard.tel.value)
+            
+            return contact_data
+        except Exception as e:
+            logger.error(f"خطأ في تحليل ملف VCF {file_path}: {str(e)}")
+            return None
+    
     async def publish_to_groups(self, admin_id=None):
         """النشر في المجموعات"""
         while self.publishing_active:
@@ -651,20 +695,45 @@ class TelegramBotManager:
                                             if not self.publishing_active:
                                                 break
                                                 
-                                            ad_id, ad_type, ad_text, media_path, file_type, added_date, ad_admin_id = ad
+                                            ad_id, ad_type, ad_text, media_path, file_type, contact_data_json, added_date, ad_admin_id = ad
                                             
                                             try:
                                                 if ad_type == 'text':
                                                     await client.send_message(dialog.id, ad_text)
                                                 elif ad_type == 'photo' and media_path and os.path.exists(media_path):
                                                     await client.send_file(dialog.id, media_path, caption=ad_text)
-                                                elif ad_type == 'contact' and media_path and os.path.exists(media_path):
-                                                    # إرسال ملف جهة الاتصال بدون نص
-                                                    await client.send_file(dialog.id, media_path)
-                                                elif media_path and os.path.exists(media_path):
-                                                    await client.send_file(dialog.id, media_path, caption=ad_text)
+                                                elif ad_type == 'contact':
+                                                    # نشر جهة اتصال
+                                                    if contact_data_json:
+                                                        try:
+                                                            contact_data = json.loads(contact_data_json)
+                                                            first_name = contact_data.get('first_name', '')
+                                                            last_name = contact_data.get('last_name', '')
+                                                            phone_number = contact_data.get('phone_number', '')
+                                                            
+                                                            if phone_number:
+                                                                # إرسال جهة اتصال مباشرة
+                                                                await client.send_contact(
+                                                                    dialog.id,
+                                                                    phone=phone_number,
+                                                                    first_name=first_name,
+                                                                    last_name=last_name
+                                                                )
+                                                                logger.info(f"تم نشر جهة اتصال في {dialog.name} بواسطة {name}")
+                                                            else:
+                                                                # إذا لم يكن هناك رقم هاتف، نرسل ملف VCF
+                                                                if media_path and os.path.exists(media_path):
+                                                                    await client.send_file(dialog.id, media_path)
+                                                                    logger.info(f"تم نشر ملف VCF في {dialog.name} بواسطة {name}")
+                                                        except Exception as e:
+                                                            logger.error(f"خطأ في نشر جهة اتصال: {str(e)}")
+                                                            # المحاولة بإرسال الملف كبديل
+                                                            if media_path and os.path.exists(media_path):
+                                                                await client.send_file(dialog.id, media_path)
+                                                    elif media_path and os.path.exists(media_path):
+                                                        # إرسال ملف VCF إذا لم تكن هناك بيانات جهة اتصال
+                                                        await client.send_file(dialog.id, media_path)
                                                 
-                                                logger.info(f"تم النشر في {dialog.name} بواسطة {name}")
                                                 await asyncio.sleep(2)
                                                 
                                             except Exception as e:
@@ -1071,8 +1140,10 @@ class BotHandler:
                 # لجهة الاتصال، نطلب الملف مباشرة بدون نص
                 await query.edit_message_text(
                     f"📞 **إضافة جهة اتصال**\n\n"
-                    f"يرجى إرسال ملف جهة الاتصال (VCF):\n\n"
-                    f"يمكنك إرسال جهة اتصال من زر 'جهة اتصال' في التليجرام\n\n"
+                    f"يرجى إرسال ملف جهة الاتصال (VCF) أو جهة اتصال مباشرة:\n\n"
+                    f"يمكنك:\n"
+                    f"1. إرسال ملف VCF\n"
+                    f"2. استخدام زر 'جهة اتصال' في التليجرام\n\n"
                     f"أو أرسل /cancel للإلغاء",
                     parse_mode='Markdown'
                 )
@@ -1379,166 +1450,83 @@ class BotHandler:
         ad_text = context.user_data.get('ad_text') or user_context.get('ad_text')
         admin_id = update.message.from_user.id
         
-        file_id = None
-        file_type = None
-        file_name = None
-        mime_type = None
+        contact_data = None
+        file_path = None
         
         # التحقق من نوع الملف المرسل
         if update.message.photo:
+            # صورة
             file_id = update.message.photo[-1].file_id
-            file_type = 'photo'
-        elif update.message.document:
-            file_id = update.message.document.file_id
-            file_type = 'document'
-            file_name = update.message.document.file_name
-            mime_type = update.message.document.mime_type
-        elif update.message.contact:
-            # جهة اتصال مباشرة (ليست ملف VCF)
-            # في هذه الحالة، سنقوم بإنشاء ملف VCF من بيانات جهة الاتصال
-            contact = update.message.contact
-            vcf_content = self.create_vcf_from_contact(contact)
+            file = await context.bot.get_file(file_id)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            file_path = f"ads/photo_{timestamp}.jpg"
+            await file.download_to_drive(file_path)
             
-            if vcf_content:
-                try:
-                    os.makedirs("ads", exist_ok=True)
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    file_path = f"ads/contact_{timestamp}.vcf"
+            # صورة مع نص
+            success = self.db.add_ad('photo', ad_text, file_path, 'photo', None, admin_id)
+            if success:
+                await update.message.reply_text("✅ تم إضافة الإعلان بالصورة بنجاح")
+            else:
+                await update.message.reply_text("❌ فشل إضافة الإعلان بالصورة")
+        
+        elif update.message.document:
+            # ملف (قد يكون VCF)
+            file_id = update.message.document.file_id
+            file_name = update.message.document.file_name
+            file = await context.bot.get_file(file_id)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # التحقق إذا كان ملف VCF
+            is_vcf = False
+            if file_name and file_name.lower().endswith(('.vcf', '.vcard')):
+                is_vcf = True
+            
+            if is_vcf:
+                file_path = f"ads/contact_{timestamp}.vcf"
+                await file.download_to_drive(file_path)
+                
+                # تحليل ملف VCF واستخراج بيانات جهة الاتصال
+                contact_data_dict = self.manager.parse_vcf_file(file_path)
+                if contact_data_dict:
+                    contact_data = json.dumps(contact_data_dict)
                     
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write(vcf_content)
-                    
-                    success = self.db.add_ad('contact', None, file_path, 'contact', admin_id)
+                    success = self.db.add_ad('contact', None, file_path, 'contact', contact_data, admin_id)
                     if success:
                         await update.message.reply_text("✅ تم إضافة جهة الاتصال بنجاح")
                     else:
                         await update.message.reply_text("❌ فشل إضافة جهة الاتصال")
-                    
-                    user_context['conversation_active'] = False
-                    context.user_data['conversation_active'] = False
-                    await self.start(update, context)
-                    return ConversationHandler.END
-                except Exception as e:
-                    logger.error(f"خطأ في حفظ جهة الاتصال: {str(e)}")
-                    await update.message.reply_text("❌ حدث خطأ أثناء حفظ جهة الاتصال")
-                    user_context['conversation_active'] = False
-                    context.user_data['conversation_active'] = False
-                    await self.start(update, context)
-                    return ConversationHandler.END
+                else:
+                    await update.message.reply_text("❌ فشل تحليل ملف VCF")
             else:
-                await update.message.reply_text("❌ فشل إنشاء ملف VCF من جهة الاتصال")
-                return ADD_AD_MEDIA
+                file_path = f"ads/document_{timestamp}.{file_name.split('.')[-1] if file_name else 'bin'}"
+                await file.download_to_drive(file_path)
+                await update.message.reply_text("❌ هذا ليس ملف VCF، يرجى إرسال ملف VCF أو جهة اتصال")
         
-        # إذا لم يكن هناك ملف
-        if not file_id and not update.message.contact:
+        elif update.message.contact:
+            # جهة اتصال مباشرة
+            contact = update.message.contact
+            contact_data_dict = {
+                'first_name': contact.first_name or '',
+                'last_name': contact.last_name or '',
+                'phone_number': contact.phone_number or ''
+            }
+            
+            contact_data = json.dumps(contact_data_dict)
+            success = self.db.add_ad('contact', None, None, 'contact', contact_data, admin_id)
+            
+            if success:
+                await update.message.reply_text("✅ تم إضافة جهة الاتصال بنجاح")
+            else:
+                await update.message.reply_text("❌ فشل إضافة جهة الاتصال")
+        
+        else:
             await update.message.reply_text("❌ يرجى إرسال صورة أو ملف VCF أو جهة اتصال")
             return ADD_AD_MEDIA
-        
-        if file_id:
-            try:
-                os.makedirs("ads", exist_ok=True)
-                
-                file = await context.bot.get_file(file_id)
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                
-                if file_type == 'photo':
-                    file_path = f"ads/photo_{timestamp}.jpg"
-                elif file_type == 'document':
-                    # تحديد نوع الملف بناءً على الاسم والمحتوى
-                    is_vcf = False
-                    
-                    # التحقق من الامتداد
-                    if file_name and file_name.lower().endswith(('.vcf', '.vcard')):
-                        is_vcf = True
-                    
-                    # التحقق من MIME type
-                    if mime_type and 'vcard' in mime_type.lower():
-                        is_vcf = True
-                    
-                    # التحقق من المحتوى (قراءة أول 100 بايت)
-                    try:
-                        temp_path = f"temp_{timestamp}.bin"
-                        await file.download_to_drive(temp_path)
-                        with open(temp_path, 'rb') as f:
-                            content_start = f.read(100).decode('utf-8', errors='ignore')
-                            if 'BEGIN:VCARD' in content_start.upper():
-                                is_vcf = True
-                        os.remove(temp_path)
-                    except:
-                        pass
-                    
-                    if is_vcf:
-                        file_path = f"ads/contact_{timestamp}.vcf"
-                        ad_type = 'contact'  # تأكيد أنه ملف اتصال
-                    else:
-                        ext = file_name.split('.')[-1] if file_name else 'bin'
-                        file_path = f"ads/document_{timestamp}.{ext}"
-                else:
-                    file_path = f"ads/file_{timestamp}"
-                
-                await file.download_to_drive(file_path)
-                
-                if ad_type == 'contact':
-                    # جهة اتصال - بدون نص
-                    success = self.db.add_ad('contact', None, file_path, 'contact', admin_id)
-                    message = "✅ تم إضافة جهة الاتصال بنجاح"
-                elif ad_type == 'photo':
-                    # صورة مع نص
-                    success = self.db.add_ad('photo', ad_text, file_path, 'photo', admin_id)
-                    message = "✅ تم إضافة الإعلان بالصورة بنجاح"
-                else:
-                    success = False
-                    message = "❌ نوع الإعلان غير معروف"
-                
-                if success:
-                    await update.message.reply_text(message)
-                else:
-                    await update.message.reply_text("❌ فشل إضافة الإعلان، حاول مرة أخرى")
-                    
-            except Exception as e:
-                logger.error(f"خطأ في حفظ الملف: {str(e)}")
-                await update.message.reply_text("❌ حدث خطأ أثناء حفظ الملف")
-        else:
-            await update.message.reply_text("❌ لم يتم التعرف على الملف")
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
-    
-    def create_vcf_from_contact(self, contact):
-        """إنشاء ملف VCF من بيانات جهة الاتصال"""
-        try:
-            vcf_lines = []
-            vcf_lines.append("BEGIN:VCARD")
-            vcf_lines.append("VERSION:3.0")
-            
-            # الاسم
-            full_name = ""
-            if contact.first_name:
-                full_name += contact.first_name
-            if contact.last_name:
-                full_name += " " + contact.last_name
-            
-            if full_name.strip():
-                vcf_lines.append(f"FN:{full_name.strip()}")
-                if contact.first_name:
-                    vcf_lines.append(f"N:{contact.last_name or ''};{contact.first_name};;;")
-            
-            # رقم الهاتف
-            if contact.phone_number:
-                vcf_lines.append(f"TEL;TYPE=CELL:{contact.phone_number}")
-            
-            # معرف المستخدم (إذا كان متاحاً)
-            if contact.user_id:
-                vcf_lines.append(f"X-TELEGRAM-ID:{contact.user_id}")
-            
-            vcf_lines.append("END:VCARD")
-            
-            return "\n".join(vcf_lines)
-        except Exception as e:
-            logger.error(f"خطأ في إنشاء VCF: {str(e)}")
-            return None
     
     async def show_ads(self, query, context):
         """عرض الإعلانات"""
@@ -1553,7 +1541,7 @@ class BotHandler:
         keyboard = []
         
         for ad in ads:
-            ad_id, ad_type, ad_text, media_path, file_type, added_date, ad_admin_id = ad
+            ad_id, ad_type, ad_text, media_path, file_type, contact_data_json, added_date, ad_admin_id = ad
             type_emoji = {"text": "📝", "photo": "🖼️", "contact": "📞"}
 
             text += f"**#{ad_id}** - {type_emoji.get(ad_type, '📄')} {ad_type}\n"
@@ -1563,7 +1551,18 @@ class BotHandler:
             elif ad_type == 'photo' and ad_text:
                 text += f"📋 {ad_text[:30]}... + صورة\n"
             elif ad_type == 'contact':
-                text += f"📞 جهة اتصال (VCF)\n"
+                if contact_data_json:
+                    try:
+                        contact_data = json.loads(contact_data_json)
+                        first_name = contact_data.get('first_name', '')
+                        last_name = contact_data.get('last_name', '')
+                        phone = contact_data.get('phone_number', '')
+                        
+                        text += f"📞 {first_name} {last_name} - {phone}\n"
+                    except:
+                        text += f"📞 جهة اتصال\n"
+                else:
+                    text += f"📞 جهة اتصال\n"
             
             text += "─" * 20 + "\n"
             
@@ -2274,9 +2273,9 @@ class BotHandler:
         print("✅ جميع المشاكل تم إصلاحها")
         print("📢 إدارة الإعلانات تعمل بشكل كامل")
         print("📞 جهات الاتصال تعمل الآن بشكل صحيح:")
-        print("   ✅ يدعم ملفات VCF")
-        print("   ✅ يدعم جهات الاتصال المباشرة")
-        print("   ✅ يدعم زر 'جهة اتصال' في التليجرام")
+        print("   ✅ حفظ بيانات جهة الاتصال بشكل منظم")
+        print("   ✅ نشر جهات الاتصال بشكل مباشر (ليس كملف)")
+        print("   ✅ يدعم جميع أنواع جهات الاتصال")
         print("👥 إدارة الحسابات تعمل بشكل كامل")
         print("💬 إدارة الردود تعمل بشكل كامل")
         print("👨‍💼 إدارة المشرفين تعمل بشكل كامل")
