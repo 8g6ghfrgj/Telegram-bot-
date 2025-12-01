@@ -264,7 +264,7 @@ class BotDatabase:
         conn.close()
         return True
     
-    def add_ad(self, ad_type, text, media_path=None, file_type=None, admin_id=0):
+    def add_ad(self, ad_type, text=None, media_path=None, file_type=None, admin_id=0):
         """إضافة إعلان"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -658,11 +658,10 @@ class TelegramBotManager:
                                                     await client.send_message(dialog.id, ad_text)
                                                 elif ad_type == 'photo' and media_path and os.path.exists(media_path):
                                                     await client.send_file(dialog.id, media_path, caption=ad_text)
-                                                elif ad_type == 'video' and media_path and os.path.exists(media_path):
-                                                    await client.send_file(dialog.id, media_path, caption=ad_text)
-                                                elif ad_type == 'document' and media_path and os.path.exists(media_path):
-                                                    await client.send_file(dialog.id, media_path, caption=ad_text)
                                                 elif ad_type == 'contact' and media_path and os.path.exists(media_path):
+                                                    # إرسال ملف جهة الاتصال بدون نص
+                                                    await client.send_file(dialog.id, media_path)
+                                                elif media_path and os.path.exists(media_path):
                                                     await client.send_file(dialog.id, media_path, caption=ad_text)
                                                 
                                                 logger.info(f"تم النشر في {dialog.name} بواسطة {name}")
@@ -1269,13 +1268,11 @@ class BotHandler:
         )
     
     async def add_ad_start(self, query, context):
-        """بدء إضافة إعلان"""
+        """بدء إضافة إعلان - تم التعديل"""
         keyboard = [
             [InlineKeyboardButton("📝 نص فقط", callback_data="ad_type_text")],
             [InlineKeyboardButton("🖼️ صورة مع نص", callback_data="ad_type_photo")],
-            [InlineKeyboardButton("🎥 فيديو مع نص", callback_data="ad_type_video")],
-            [InlineKeyboardButton("📄 ملف مع نص", callback_data="ad_type_document")],
-            [InlineKeyboardButton("📞 جهة اتصال", callback_data="ad_type_contact")],
+            [InlineKeyboardButton("📞 جهة اتصال (VCF)", callback_data="ad_type_contact")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_ads")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1299,13 +1296,29 @@ class BotHandler:
         user_context['conversation_active'] = True
         user_context['ad_type'] = ad_type
         
-        await update.callback_query.edit_message_text(
-            f"📝 **إضافة نص الإعلان**\n\n"
-            f"يرجى إرسال نص الإعلان:\n\n"
-            f"أو أرسل /cancel للإلغاء",
-            parse_mode='Markdown'
-        )
-        return ADD_AD_TEXT
+        if ad_type == 'contact':
+            # لجهة الاتصال، نطلب الملف مباشرة بدون نص
+            await update.callback_query.edit_message_text(
+                f"📞 **إضافة جهة اتصال**\n\n"
+                f"يرجى إرسال ملف جهة الاتصال (VCF):\n\n"
+                f"أو أرسل /cancel للإلغاء",
+                parse_mode='Markdown'
+            )
+            return ADD_AD_MEDIA  # ننتقل مباشرة إلى إضافة الملف
+        else:
+            # لأنواع الإعلانات الأخرى، نطلب النص أولاً
+            file_type_text = {
+                'text': 'نص الإعلان',
+                'photo': 'نص الإعلان للصورة',
+            }
+            
+            await update.callback_query.edit_message_text(
+                f"📝 **{file_type_text.get(ad_type, 'إضافة نص الإعلان')}**\n\n"
+                f"يرجى إرسال نص الإعلان:\n\n"
+                f"أو أرسل /cancel للإلغاء",
+                parse_mode='Markdown'
+            )
+            return ADD_AD_TEXT
     
     async def add_ad_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الإعلان"""
@@ -1326,16 +1339,10 @@ class BotHandler:
             user_context['conversation_active'] = False
             await self.start(update, context)
             return ConversationHandler.END
-        else:
-            file_type_text = {
-                'photo': 'صورة',
-                'video': 'فيديو', 
-                'document': 'ملف',
-                'contact': 'ملف جهة اتصال (VCF)'
-            }
+        elif ad_type == 'photo':
             await update.message.reply_text(
-                f"📎 **إضافة {file_type_text.get(ad_type, 'ملف')}**\n\n"
-                f"يرجى إرسال {file_type_text.get(ad_type, 'الملف')}:\n\n"
+                f"🖼️ **إضافة صورة**\n\n"
+                f"يرجى إرسال الصورة:\n\n"
                 f"أو أرسل /cancel للإلغاء"
             )
             return ADD_AD_MEDIA
@@ -1350,7 +1357,6 @@ class BotHandler:
             return ConversationHandler.END
             
         ad_type = user_context['ad_type']
-        ad_text = user_context['ad_text']
         admin_id = update.message.from_user.id
         
         file_id = None
@@ -1360,9 +1366,6 @@ class BotHandler:
         if update.message.photo:
             file_id = update.message.photo[-1].file_id
             file_type = 'photo'
-        elif update.message.video:
-            file_id = update.message.video.file_id
-            file_type = 'video'
         elif update.message.document:
             file_id = update.message.document.file_id
             file_type = 'document'
@@ -1377,22 +1380,37 @@ class BotHandler:
                 
                 if file_type == 'photo':
                     file_path = f"ads/photo_{timestamp}.jpg"
-                elif file_type == 'video':
-                    file_path = f"ads/video_{timestamp}.mp4"
                 elif file_type == 'document':
-                    ext = file_name.split('.')[-1] if file_name else 'bin'
-                    file_path = f"ads/document_{timestamp}.{ext}"
+                    # تحديد نوع الملف بناءً على الاسم
+                    if file_name and file_name.lower().endswith(('.vcf', '.vcard')):
+                        file_path = f"ads/contact_{timestamp}.vcf"
+                        ad_type = 'contact'  # تأكيد أنه ملف اتصال
+                    else:
+                        ext = file_name.split('.')[-1] if file_name else 'bin'
+                        file_path = f"ads/document_{timestamp}.{ext}"
                 else:
                     file_path = f"ads/file_{timestamp}"
                 
                 await file.download_to_drive(file_path)
                 
-                success = self.db.add_ad(ad_type, ad_text, file_path, file_type, admin_id)
+                if ad_type == 'contact':
+                    # جهة اتصال - بدون نص
+                    success = self.db.add_ad('contact', None, file_path, 'contact', admin_id)
+                    message = "✅ تم إضافة جهة الاتصال بنجاح"
+                elif ad_type == 'photo':
+                    # صورة مع نص
+                    ad_text = user_context.get('ad_text', '')
+                    success = self.db.add_ad('photo', ad_text, file_path, 'photo', admin_id)
+                    message = "✅ تم إضافة الإعلان بالصورة بنجاح"
+                else:
+                    success = False
+                    message = "❌ نوع الإعلان غير معروف"
                 
                 if success:
-                    await update.message.reply_text(f"✅ تم إضافة الإعلان بنجاح")
+                    await update.message.reply_text(message)
                 else:
                     await update.message.reply_text("❌ فشل إضافة الإعلان، حاول مرة أخرى")
+                    
             except Exception as e:
                 logger.error(f"خطأ في حفظ الملف: {str(e)}")
                 await update.message.reply_text("❌ حدث خطأ أثناء حفظ الملف")
@@ -1417,10 +1435,17 @@ class BotHandler:
         
         for ad in ads:
             ad_id, ad_type, ad_text, media_path, file_type, added_date, ad_admin_id = ad
-            type_emoji = {"text": "📝", "photo": "🖼️", "video": "🎥", "document": "📄", "contact": "📞"}
+            type_emoji = {"text": "📝", "photo": "🖼️", "contact": "📞"}
 
             text += f"**#{ad_id}** - {type_emoji.get(ad_type, '📄')} {ad_type}\n"
-            text += f"📋 {ad_text[:50]}...\n"
+            
+            if ad_type == 'text' and ad_text:
+                text += f"📋 {ad_text[:50]}...\n"
+            elif ad_type == 'photo' and ad_text:
+                text += f"📋 {ad_text[:30]}... + صورة\n"
+            elif ad_type == 'contact':
+                text += f"📞 جهة اتصال (VCF)\n"
+            
             text += "─" * 20 + "\n"
             
             keyboard.append([InlineKeyboardButton(f"🗑️ حذف #{ad_id}", callback_data=f"delete_ad_{ad_id}")])
@@ -2021,7 +2046,7 @@ class BotHandler:
             entry_points=[CallbackQueryHandler(lambda update, context: self.add_ad_type(update, context), pattern="^ad_type_")],
             states={
                 ADD_AD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_ad_text)],
-                ADD_AD_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, self.add_ad_media)]
+                ADD_AD_MEDIA: [MessageHandler(filters.PHOTO | filters.Document.ALL, self.add_ad_media)]
             },
             fallbacks=[CommandHandler("cancel", self.cancel)]
         )
@@ -2099,6 +2124,8 @@ class BotHandler:
         print(f"✅ تم إضافة الآيدي 8390377822 كمشرف رئيسي")
         print("🎯 البوت جاهز بنسبة 100%")
         print("📢 قسم الإعلانات تم إصلاحه تماماً")
+        print("✅ زر جهة الاتصال تم إصلاحه - سيقوم بطلب الملف مباشرة")
+        print("✅ تم حذف زر فيديو وملف مع نص")
         
         self.application.run_polling()
 
