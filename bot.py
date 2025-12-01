@@ -9,6 +9,10 @@ from datetime import datetime, timedelta
 from threading import Thread
 from queue import Queue
 
+# إضافة dotenv لقراءة المتغيرات
+from dotenv import load_dotenv
+load_dotenv()
+
 from telegram import (
     Update, 
     InlineKeyboardButton, 
@@ -29,16 +33,31 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
 from telethon.errors import SessionPasswordNeededError
 
-# تكوين البوت - قراءة التوكن من متغير البيئة
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '8500469877:AAGCNojz50p2U2RJrQ85TEGuuR4b-S7XaLo')
+# ===== تكوين البوت =====
+# قراءة التوكن من متغير البيئة أو من ملف .env
+BOT_TOKEN = os.environ.get('8500469877:AAGCNojz50p2U2RJrQ85TEGuuR4b-S7XaLo')
+if not BOT_TOKEN:
+    # محاولة قراءة من ملف .env إذا كان محلياً
+    try:
+        with open('.env', 'r') as f:
+            for line in f:
+                if line.startswith('BOT_TOKEN='):
+                    BOT_TOKEN = line.split('=')[1].strip()
+                    break
+    except:
+        pass
 
-# إعدادات قاعدة البيانات
+if not BOT_TOKEN:
+    print("❌ خطأ: BOT_TOKEN غير موجود!")
+    print("يرجى إضافته في ملف .env أو متغيرات البيئة")
+    exit(1)
+
+# ===== إعدادات قاعدة البيانات =====
 DB_NAME = "bot_database.db"
 
-# حالات المحادثة
+# ===== حالات المحادثة =====
 (
     ADD_ACCOUNT, ADD_AD_TYPE, ADD_AD_TEXT, ADD_AD_MEDIA, ADD_GROUP, 
     ADD_PRIVATE_REPLY, ADD_GROUP_REPLY, ADD_ADMIN, 
@@ -46,12 +65,18 @@ DB_NAME = "bot_database.db"
     ADD_GROUP_PHOTO
 ) = range(13)
 
-# تهيئة السجل
+# ===== تهيئة السجل =====
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
 )
 logger = logging.getLogger(__name__)
+
+# ===== فئات البوت =====
 
 class BotDatabase:
     def __init__(self):
@@ -2012,18 +2037,23 @@ class BotHandler:
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.setup_handlers()
         
-        self.db.add_admin(8390377822, "@user", "المشرف الرئيسي", True)
+        # إضافة المشرف الرئيسي تلقائياً عند التشغيل الأول
+        try:
+            self.db.add_admin(8390377822, "@user", "المشرف الرئيسي", True)
+            print("✅ تم إضافة الآيدي 8390377822 كمشرف رئيسي")
+        except:
+            print("⚠️ المشرف الرئيسي مضاف مسبقاً")
         
         print("🤖 البوت يعمل الآن...")
-        print("✅ تم إضافة الآيدي 8390377822 كمشرف رئيسي")
         print("🎯 البوت جاهز بنسبة 100%")
+        
+        # إنشاء المجلدات المطلوبة
+        os.makedirs("ads", exist_ok=True)
+        os.makedirs("profile_photos", exist_ok=True)
+        os.makedirs("group_replies", exist_ok=True)
         
         self.application.run_polling()
 
 if __name__ == "__main__":
-    os.makedirs("ads", exist_ok=True)
-    os.makedirs("profile_photos", exist_ok=True)
-    os.makedirs("group_replies", exist_ok=True)
-    
     bot = BotHandler()
     bot.run()
