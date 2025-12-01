@@ -5,9 +5,11 @@ import logging
 import sqlite3
 import random
 import string
+import threading
 from datetime import datetime, timedelta
 from threading import Thread
 from queue import Queue
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import (
     Update, 
@@ -29,13 +31,30 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
 from telethon.errors import SessionPasswordNeededError
 
-# توكن البوت - يأتي من متغير البيئة
+# خادم HTTP بسيط لمشكلة Port
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is running!')
+    
+    def log_message(self, *args):
+        pass
+
+def run_health_server():
+    """تشغيل خادم HTTP للتحقق من الصحة"""
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"✅ Health server running on port {port}")
+    server.serve_forever()
+
+# تكوين البوت - قراءة التوكن من متغير البيئة
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
-# إذا لم يوجد توكن، توقف
+# التحقق من وجود التوكن
 if not BOT_TOKEN:
     print("❌ خطأ: لم يتم تعيين BOT_TOKEN في متغيرات البيئة")
     print("⚠️  يرجى إضافة BOT_TOKEN في Render.com → Environment")
@@ -2027,10 +2046,21 @@ class BotHandler:
         
         self.application.run_polling()
 
+# الجزء الأخير من الكود (بعد class BotHandler):
 if __name__ == "__main__":
+    # بدء خادم HTTP في خيط منفصل
+    http_thread = threading.Thread(target=run_health_server, daemon=True)
+    http_thread.start()
+    
+    # إنشاء المجلدات المطلوبة
     os.makedirs("ads", exist_ok=True)
     os.makedirs("profile_photos", exist_ok=True)
     os.makedirs("group_replies", exist_ok=True)
     
-    bot = BotHandler()
-    bot.run()
+    # تشغيل البوت
+    try:
+        bot = BotHandler()
+        print("🤖 Starting Telegram Bot...")
+        bot.run()
+    except Exception as e:
+        print(f"❌ Error: {e}")
