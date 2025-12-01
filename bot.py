@@ -269,14 +269,19 @@ class BotDatabase:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
-        cursor.execute('''
-            INSERT INTO ads (type, text, media_path, file_type, admin_id)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (ad_type, text, media_path, file_type, admin_id))
-        
-        conn.commit()
-        conn.close()
-        return True
+        try:
+            cursor.execute('''
+                INSERT INTO ads (type, text, media_path, file_type, admin_id)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (ad_type, text, media_path, file_type, admin_id))
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"خطأ في إضافة الإعلان: {str(e)}")
+            return False
+        finally:
+            conn.close()
     
     def get_ads(self, admin_id=None):
         """الحصول على جميع الإعلانات"""
@@ -469,8 +474,8 @@ class BotDatabase:
         
         cursor.execute('''
             INSERT INTO group_photo_replies (trigger, reply_text, media_path, admin_id)
-            VALUES (?, ?, ?, ?)
-        ''', (trigger, reply_text, media_path, admin_id))
+                VALUES (?, ?, ?, ?)
+            ''', (trigger, reply_text, media_path, admin_id))
         
         conn.commit()
         conn.close()
@@ -510,7 +515,7 @@ class BotDatabase:
         cursor = conn.cursor()
         
         if admin_id is not None:
-            cursor.execute('SELECT * FROM group_random_replies WHERE admin_id = ? OR admin_id = 0 AND is_active = 1 ORDER BY id', (admin_id,))
+            cursor.execute('SELECT * FROM group_random_replies WHERE (admin_id = ? OR admin_id = 0) AND is_active = 1 ORDER BY id', (admin_id,))
         else:
             cursor.execute('SELECT * FROM group_random_replies WHERE is_active = 1 ORDER BY id')
             
@@ -554,6 +559,7 @@ class TelegramBotManager:
         self.group_reply_thread = None
         self.random_reply_active = False
         self.random_reply_thread = None
+        self.lock = threading.Lock()
     
     async def test_session(self, session_string):
         """اختبار جلسة تيليجرام"""
@@ -605,7 +611,7 @@ class TelegramBotManager:
                             self.db.update_group_status(group_id, 'failed')
                     
                     await client.disconnect()
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(5)
                     
                 except Exception as e:
                     logger.error(f"خطأ في الحساب {name}: {str(e)}")
@@ -660,7 +666,7 @@ class TelegramBotManager:
                                                     await client.send_file(dialog.id, media_path, caption=ad_text)
                                                 
                                                 logger.info(f"تم النشر في {dialog.name} بواسطة {name}")
-                                                await asyncio.sleep(1)
+                                                await asyncio.sleep(2)
                                                 
                                             except Exception as e:
                                                 logger.error(f"فشل نشر الإعلان {ad_id} في {dialog.name}: {str(e)}")
@@ -676,7 +682,7 @@ class TelegramBotManager:
                         logger.error(f"خطأ في الحساب {name}: {str(e)}")
                         continue
                 
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)
                 
             except Exception as e:
                 logger.error(f"خطأ في عملية النشر: {str(e)}")
@@ -684,20 +690,25 @@ class TelegramBotManager:
     
     def start_publishing(self, admin_id=None):
         """بدء النشر التلقائي"""
-        if not self.publishing_active:
-            self.publishing_active = True
-            self.publishing_thread = Thread(target=lambda: asyncio.run(self.publish_to_groups(admin_id)))
-            self.publishing_thread.start()
-            return True
+        with self.lock:
+            if not self.publishing_active:
+                self.publishing_active = True
+                self.publishing_thread = Thread(target=lambda: asyncio.run(self.publish_to_groups(admin_id)))
+                self.publishing_thread.start()
+                return True
         return False
     
     def stop_publishing(self):
         """إيقاف النشر التلقائي"""
-        if self.publishing_active:
-            self.publishing_active = False
-            if self.publishing_thread:
-                self.publishing_thread.join()
-            return True
+        with self.lock:
+            if self.publishing_active:
+                self.publishing_active = False
+                if self.publishing_thread:
+                    try:
+                        self.publishing_thread.join(timeout=5)
+                    except:
+                        pass
+                return True
         return False
     
     async def handle_private_messages(self, admin_id=None):
@@ -722,17 +733,18 @@ class TelegramBotManager:
                         await client.connect()
                         
                         if await client.is_user_authorized():
-                            async for message in client.iter_messages(None, limit=10):
+                            async for message in client.iter_messages(None, limit=5):
                                 if not self.private_reply_active:
                                     break
                                     
                                 if message.is_private and not message.out:
                                     for reply in private_replies:
                                         reply_id, reply_text, is_active, added_date, reply_admin_id = reply
-                                        await client.send_message(message.sender_id, reply_text)
-                                        logger.info(f"تم الرد على رسالة خاصة بواسطة {name}")
-                                        break
-                                    await asyncio.sleep(2)
+                                        if is_active:
+                                            await client.send_message(message.sender_id, reply_text)
+                                            logger.info(f"تم الرد على رسالة خاصة بواسطة {name}")
+                                            await asyncio.sleep(1)
+                                            break
                         
                         await client.disconnect()
                         
@@ -740,28 +752,33 @@ class TelegramBotManager:
                         logger.error(f"خطأ في الحساب {name}: {str(e)}")
                         continue
                 
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
                 
             except Exception as e:
                 logger.error(f"خطأ في معالجة الرسائل الخاصة: {str(e)}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
     
     def start_private_reply(self, admin_id=None):
         """بدء الرد على الرسائل الخاصة"""
-        if not self.private_reply_active:
-            self.private_reply_active = True
-            self.private_reply_thread = Thread(target=lambda: asyncio.run(self.handle_private_messages(admin_id)))
-            self.private_reply_thread.start()
-            return True
+        with self.lock:
+            if not self.private_reply_active:
+                self.private_reply_active = True
+                self.private_reply_thread = Thread(target=lambda: asyncio.run(self.handle_private_messages(admin_id)))
+                self.private_reply_thread.start()
+                return True
         return False
     
     def stop_private_reply(self):
         """إيقاف الرد على الرسائل الخاصة"""
-        if self.private_reply_active:
-            self.private_reply_active = False
-            if self.private_reply_thread:
-                self.private_reply_thread.join()
-            return True
+        with self.lock:
+            if self.private_reply_active:
+                self.private_reply_active = False
+                if self.private_reply_thread:
+                    try:
+                        self.private_reply_thread.join(timeout=5)
+                    except:
+                        pass
+                return True
         return False
     
     async def handle_group_replies(self, admin_id=None):
@@ -795,7 +812,7 @@ class TelegramBotManager:
                                     
                                 if dialog.is_group:
                                     try:
-                                        async for message in client.iter_messages(dialog.id, limit=10):
+                                        async for message in client.iter_messages(dialog.id, limit=5):
                                             if not self.group_reply_active:
                                                 break
                                                 
@@ -804,20 +821,20 @@ class TelegramBotManager:
                                                 for reply in text_replies:
                                                     reply_id, trigger, reply_text, is_active, added_date, reply_admin_id = reply
                                                     
-                                                    if trigger.lower() in message.text.lower():
+                                                    if is_active and trigger.lower() in message.text.lower():
                                                         await client.send_message(dialog.id, reply_text, reply_to=message.id)
                                                         logger.info(f"تم الرد على رسالة في {dialog.name} بواسطة {name}")
-                                                        await asyncio.sleep(2)
+                                                        await asyncio.sleep(1)
                                                         break
                                                 
                                                 # الردود مع الصور
                                                 for reply in photo_replies:
                                                     reply_id, trigger, reply_text, media_path, is_active, added_date, reply_admin_id = reply
                                                     
-                                                    if trigger.lower() in message.text.lower() and os.path.exists(media_path):
+                                                    if is_active and trigger.lower() in message.text.lower() and os.path.exists(media_path):
                                                         await client.send_file(dialog.id, media_path, caption=reply_text, reply_to=message.id)
                                                         logger.info(f"تم الرد بصورة على رسالة في {dialog.name} بواسطة {name}")
-                                                        await asyncio.sleep(2)
+                                                        await asyncio.sleep(1)
                                                         break
                                         
                                     except Exception as e:
@@ -830,28 +847,33 @@ class TelegramBotManager:
                         logger.error(f"خطأ في الحساب {name}: {str(e)}")
                         continue
                 
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
                 
             except Exception as e:
                 logger.error(f"خطأ في معالجة الردود الجماعية: {str(e)}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
     
     def start_group_reply(self, admin_id=None):
         """بدء الردود في المجموعات"""
-        if not self.group_reply_active:
-            self.group_reply_active = True
-            self.group_reply_thread = Thread(target=lambda: asyncio.run(self.handle_group_replies(admin_id)))
-            self.group_reply_thread.start()
-            return True
+        with self.lock:
+            if not self.group_reply_active:
+                self.group_reply_active = True
+                self.group_reply_thread = Thread(target=lambda: asyncio.run(self.handle_group_replies(admin_id)))
+                self.group_reply_thread.start()
+                return True
         return False
     
     def stop_group_reply(self):
         """إيقاف الردود في المجموعات"""
-        if self.group_reply_active:
-            self.group_reply_active = False
-            if self.group_reply_thread:
-                self.group_reply_thread.join()
-            return True
+        with self.lock:
+            if self.group_reply_active:
+                self.group_reply_active = False
+                if self.group_reply_thread:
+                    try:
+                        self.group_reply_thread.join(timeout=5)
+                    except:
+                        pass
+                return True
         return False
     
     async def handle_random_replies(self, admin_id=None):
@@ -884,20 +906,19 @@ class TelegramBotManager:
                                     
                                 if dialog.is_group:
                                     try:
-                                        # مراقبة الرسائل الجديدة في المجموعة
-                                        async for message in client.iter_messages(dialog.id, limit=20):
+                                        async for message in client.iter_messages(dialog.id, limit=3):
                                             if not self.random_reply_active:
                                                 break
                                                 
-                                            # الرد على أي رسالة من الأعضاء (ليست من الحساب نفسه) بنسبة 100%
                                             if message.text and not message.out:
                                                 random_reply = random.choice(random_replies)
                                                 reply_id, reply_text, is_active, added_date, reply_admin_id = random_reply
                                                 
-                                                await client.send_message(dialog.id, reply_text, reply_to=message.id)
-                                                logger.info(f"تم الرد العشوائي على عضو في {dialog.name} بواسطة {name}")
-                                                await asyncio.sleep(5)  # تأخير بين الردود
-                                                break
+                                                if is_active:
+                                                    await client.send_message(dialog.id, reply_text, reply_to=message.id)
+                                                    logger.info(f"تم الرد العشوائي على عضو في {dialog.name} بواسطة {name}")
+                                                    await asyncio.sleep(1)
+                                                    break
                                         
                                     except Exception as e:
                                         logger.error(f"فشل الرد العشوائي في {dialog.name}: {str(e)}")
@@ -909,28 +930,33 @@ class TelegramBotManager:
                         logger.error(f"خطأ في الحساب {name}: {str(e)}")
                         continue
                 
-                await asyncio.sleep(20)  # فحص المجموعات كل 20 ثانية
+                await asyncio.sleep(10)
                 
             except Exception as e:
                 logger.error(f"خطأ في معالجة الردود العشوائية: {str(e)}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
     
     def start_random_reply(self, admin_id=None):
         """بدء الردود العشوائية في القروبات"""
-        if not self.random_reply_active:
-            self.random_reply_active = True
-            self.random_reply_thread = Thread(target=lambda: asyncio.run(self.handle_random_replies(admin_id)))
-            self.random_reply_thread.start()
-            return True
+        with self.lock:
+            if not self.random_reply_active:
+                self.random_reply_active = True
+                self.random_reply_thread = Thread(target=lambda: asyncio.run(self.handle_random_replies(admin_id)))
+                self.random_reply_thread.start()
+                return True
         return False
     
     def stop_random_reply(self):
         """إيقاف الردود العشوائية في القروبات"""
-        if self.random_reply_active:
-            self.random_reply_active = False
-            if self.random_reply_thread:
-                self.random_reply_thread.join()
-            return True
+        with self.lock:
+            if self.random_reply_active:
+                self.random_reply_active = False
+                if self.random_reply_thread:
+                    try:
+                        self.random_reply_thread.join(timeout=5)
+                    except:
+                        pass
+                return True
         return False
 
 class BotHandler:
@@ -938,6 +964,13 @@ class BotHandler:
         self.db = BotDatabase()
         self.manager = TelegramBotManager(self.db)
         self.application = None
+        self.user_conversations = {}
+    
+    def get_user_context(self, user_id):
+        """الحصول على سياق المستخدم"""
+        if user_id not in self.user_conversations:
+            self.user_conversations[user_id] = {}
+        return self.user_conversations[user_id]
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء البوت"""
@@ -948,8 +981,8 @@ class BotHandler:
             await update.message.reply_text("❌ ليس لديك صلاحية للوصول إلى هذا البوت.")
             return
         
-        if context.user_data.get('conversation_active'):
-            context.user_data['conversation_active'] = False
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = False
         
         # ترتيب جديد للوحة التحكم
         keyboard = [
@@ -977,7 +1010,9 @@ class BotHandler:
             await update.message.reply_text("❌ ليس لديك صلاحية للوصول إلى هذا البوت.")
             return
         
-        context.user_data['conversation_active'] = False
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = False
+        
         await update.message.reply_text("❌ تم إلغاء الأمر.")
         await self.start(update, context)
         return ConversationHandler.END
@@ -994,8 +1029,7 @@ class BotHandler:
         
         data = query.data
         
-        if context.user_data.get('conversation_active'):
-            context.user_data['conversation_active'] = False
+        user_context = self.get_user_context(user_id)
         
         if data == "manage_accounts":
             await self.manage_accounts(query, context)
@@ -1027,8 +1061,11 @@ class BotHandler:
         elif data.startswith("delete_ad_"):
             ad_id = int(data.split("_")[2])
             await self.delete_ad(query, context, ad_id)
+        
+        # أنواع الإعلانات
         elif data.startswith("ad_type_"):
-            await self.add_ad_type(update, context)
+            ad_type = data.replace("ad_type_", "")
+            await self.add_ad_type(update, context, ad_type)
         
         # إدارة المجموعات
         elif data == "add_group":
@@ -1091,8 +1128,9 @@ class BotHandler:
     
     async def start_from_query(self, query, context):
         """بدء البوت من استعلام"""
-        if context.user_data.get('conversation_active'):
-            context.user_data['conversation_active'] = False
+        user_id = query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = False
             
         keyboard = [
             [InlineKeyboardButton("👥 إدارة الحسابات", callback_data="manage_accounts")],
@@ -1131,35 +1169,32 @@ class BotHandler:
     
     async def add_account_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء إضافة حساب"""
-        context.user_data['conversation_active'] = True
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
         
-        if update.callback_query:
-            query = update.callback_query
-            await query.edit_message_text(
-                "📱 **إضافة حساب جديد**\n\n"
-                "يرجى إرسال كود الجلسة (Session String):\n\n"
-                "يمكنك الحصول على كود الجلسة من @SessionStringBot\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "📱 **إضافة حساب جديد**\n\n"
-                "يرجى إرسال كود الجلسة (Session String):\n\n"
-                "يمكنك الحصول على كود الجلسة من @SessionStringBot\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
+        await update.callback_query.edit_message_text(
+            "📱 **إضافة حساب جديد**\n\n"
+            "يرجى إرسال كود الجلسة (Session String):\n\n"
+            "يمكنك الحصول على كود الجلسة من @SessionStringBot\n\n"
+            "أو أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
         return ADD_ACCOUNT
     
     async def add_account_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة كود الجلسة"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
         session_string = update.message.text
         admin_id = update.message.from_user.id
+        
+        await update.message.reply_text("⏳ جاري اختبار الجلسة...")
         
         success, me = await self.manager.test_session(session_string)
         
@@ -1177,7 +1212,7 @@ class BotHandler:
         else:
             await update.message.reply_text("❌ كود الجلسة غير صالح أو الحساب غير مفعل")
         
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
@@ -1216,7 +1251,7 @@ class BotHandler:
         await query.edit_message_text(f"✅ تم حذف الحساب #{account_id}")
         await self.show_accounts(query, context)
     
-    # قسم إدارة الإعلانات
+    # قسم إدارة الإعلانات - تم التصحيح
     async def manage_ads(self, query, context):
         """إدارة الإعلانات"""
         keyboard = [
@@ -1240,7 +1275,7 @@ class BotHandler:
             [InlineKeyboardButton("🖼️ صورة مع نص", callback_data="ad_type_photo")],
             [InlineKeyboardButton("🎥 فيديو مع نص", callback_data="ad_type_video")],
             [InlineKeyboardButton("📄 ملف مع نص", callback_data="ad_type_document")],
-            [InlineKeyboardButton("📞 جهة اتصال (VCF)", callback_data="ad_type_contact")],
+            [InlineKeyboardButton("📞 جهة اتصال", callback_data="ad_type_contact")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_ads")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1252,37 +1287,43 @@ class BotHandler:
             parse_mode='Markdown'
         )
     
-    async def add_ad_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def add_ad_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE, ad_type=None):
         """معالجة نوع الإعلان"""
-        query = update.callback_query
-        await query.answer()
+        if not ad_type:
+            query = update.callback_query
+            await query.answer()
+            ad_type = query.data.replace("ad_type_", "")
         
-        context.user_data['conversation_active'] = True
-        ad_type = query.data.replace("ad_type_", "")
-        context.user_data['ad_type'] = ad_type
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
+        user_context['ad_type'] = ad_type
         
-        await query.edit_message_text(
-            "📝 **إضافة نص الإعلان**\n\n"
-            "يرجى إرسال نص الإعلان:\n\n"
-            "أو أرسل /cancel للإلغاء",
+        await update.callback_query.edit_message_text(
+            f"📝 **إضافة نص الإعلان**\n\n"
+            f"يرجى إرسال نص الإعلان:\n\n"
+            f"أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
         return ADD_AD_TEXT
     
     async def add_ad_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الإعلان"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
-        context.user_data['ad_text'] = update.message.text
-        ad_type = context.user_data['ad_type']
+        user_context['ad_text'] = update.message.text
+        ad_type = user_context['ad_type']
         admin_id = update.message.from_user.id
         
         if ad_type == 'text':
             self.db.add_ad('text', update.message.text, admin_id=admin_id)
             await update.message.reply_text("✅ تم إضافة الإعلان النصي بنجاح")
-            context.user_data['conversation_active'] = False
+            user_context['conversation_active'] = False
             await self.start(update, context)
             return ConversationHandler.END
         else:
@@ -1301,16 +1342,20 @@ class BotHandler:
     
     async def add_ad_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة ملف الإعلان"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
-        ad_type = context.user_data['ad_type']
-        ad_text = context.user_data['ad_text']
+        ad_type = user_context['ad_type']
+        ad_text = user_context['ad_text']
         admin_id = update.message.from_user.id
         
         file_id = None
         file_type = None
+        file_name = None
         
         if update.message.photo:
             file_id = update.message.photo[-1].file_id
@@ -1321,18 +1366,40 @@ class BotHandler:
         elif update.message.document:
             file_id = update.message.document.file_id
             file_type = 'document'
+            file_name = update.message.document.file_name
         
         if file_id:
-            file = await context.bot.get_file(file_id)
-            file_path = f"ads/{file_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            await file.download_to_drive(file_path)
-            
-            self.db.add_ad(ad_type, ad_text, file_path, file_type, admin_id)
-            await update.message.reply_text(f"✅ تم إضافة الإعلان بنجاح")
+            try:
+                os.makedirs("ads", exist_ok=True)
+                
+                file = await context.bot.get_file(file_id)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                
+                if file_type == 'photo':
+                    file_path = f"ads/photo_{timestamp}.jpg"
+                elif file_type == 'video':
+                    file_path = f"ads/video_{timestamp}.mp4"
+                elif file_type == 'document':
+                    ext = file_name.split('.')[-1] if file_name else 'bin'
+                    file_path = f"ads/document_{timestamp}.{ext}"
+                else:
+                    file_path = f"ads/file_{timestamp}"
+                
+                await file.download_to_drive(file_path)
+                
+                success = self.db.add_ad(ad_type, ad_text, file_path, file_type, admin_id)
+                
+                if success:
+                    await update.message.reply_text(f"✅ تم إضافة الإعلان بنجاح")
+                else:
+                    await update.message.reply_text("❌ فشل إضافة الإعلان، حاول مرة أخرى")
+            except Exception as e:
+                logger.error(f"خطأ في حفظ الملف: {str(e)}")
+                await update.message.reply_text("❌ حدث خطأ أثناء حفظ الملف")
         else:
             await update.message.reply_text("❌ لم يتم التعرف على الملف")
         
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
@@ -1391,30 +1458,25 @@ class BotHandler:
     
     async def add_group_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء إضافة مجموعة"""
-        context.user_data['conversation_active'] = True
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
         
-        if update.callback_query:
-            query = update.callback_query
-            await query.edit_message_text(
-                "👥 **إضافة مجموعة جديدة**\n\n"
-                "يرجى إرسال رابط المجموعة:\n\n"
-                "يمكنك إرسال رابط واحد أو عدة روابط مفصولة بمسافات\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "👥 **إضافة مجموعة جديدة**\n\n"
-                "يرجى إرسال رابط المجموعة:\n\n"
-                "يمكنك إرسال رابط واحد أو عدة روابط مفصولة بمسافات\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
+        await update.callback_query.edit_message_text(
+            "👥 **إضافة مجموعة جديدة**\n\n"
+            "يرجى إرسال رابط المجموعة:\n\n"
+            "يمكنك إرسال رابط واحد أو عدة روابط مفصولة بمسافات\n\n"
+            "أو أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
         return ADD_GROUP
     
     async def add_group_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة رابط المجموعة"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
@@ -1433,7 +1495,7 @@ class BotHandler:
         else:
             await update.message.reply_text("❌ لم يتم إضافة أي مجموعة، تأكد من صحة الروابط")
         
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
@@ -1527,28 +1589,24 @@ class BotHandler:
     
     async def add_private_reply_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء إضافة رد خاص"""
-        context.user_data['conversation_active'] = True
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
         
-        if update.callback_query:
-            query = update.callback_query
-            await query.edit_message_text(
-                "💬 **إضافة رد في الخاص**\n\n"
-                "يرجى إرسال نص الرد الذي سيتم إرساله للمستخدمين في الخاص:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "💬 **إضافة رد في الخاص**\n\n"
-                "يرجى إرسال نص الرد الذي سيتم إرساله للمستخدمين في الخاص:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
+        await update.callback_query.edit_message_text(
+            "💬 **إضافة رد في الخاص**\n\n"
+            "يرجى إرسال نص الرد الذي سيتم إرساله للمستخدمين في الخاص:\n\n"
+            "أو أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
         return ADD_PRIVATE_TEXT
     
     async def add_private_reply_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الرد الخاص"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
@@ -1557,7 +1615,7 @@ class BotHandler:
         
         self.db.add_private_reply(reply_text, admin_id=admin_id)
         await update.message.reply_text("✅ تم إضافة الرد في الخاص بنجاح")
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
@@ -1637,32 +1695,28 @@ class BotHandler:
     
     async def add_group_text_reply_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء إضافة رد نصي في القروبات"""
-        context.user_data['conversation_active'] = True
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
         
-        if update.callback_query:
-            query = update.callback_query
-            await query.edit_message_text(
-                "👥 **إضافة رد نصي في القروبات**\n\n"
-                "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "👥 **إضافة رد نصي في القروبات**\n\n"
-                "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
+        await update.callback_query.edit_message_text(
+            "👥 **إضافة رد نصي في القروبات**\n\n"
+            "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
+            "أو أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
         return ADD_GROUP_TEXT
     
     async def add_group_text_reply_trigger(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الرد النصي"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
-        context.user_data['group_text_trigger'] = update.message.text
+        user_context['group_text_trigger'] = update.message.text
         
         await update.message.reply_text(
             "👥 **إضافة رد نصي في القروبات**\n\n"
@@ -1674,48 +1728,47 @@ class BotHandler:
     
     async def add_group_text_reply_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الرد النصي"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
-        trigger = context.user_data['group_text_trigger']
+        trigger = user_context['group_text_trigger']
         reply_text = update.message.text
         admin_id = update.message.from_user.id
         
         self.db.add_group_text_reply(trigger, reply_text, admin_id=admin_id)
         await update.message.reply_text("✅ تم إضافة الرد النصي في القروبات بنجاح")
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
     async def add_group_photo_reply_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء إضافة رد مع صورة في القروبات"""
-        context.user_data['conversation_active'] = True
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
         
-        if update.callback_query:
-            query = update.callback_query
-            await query.edit_message_text(
-                "👥 **إضافة رد مع صورة في القروبات**\n\n"
-                "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "👥 **إضافة رد مع صورة في القروبات**\n\n"
-                "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
+        await update.callback_query.edit_message_text(
+            "👥 **إضافة رد مع صورة في القروبات**\n\n"
+            "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
+            "أو أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
         return ADD_GROUP_PHOTO
     
     async def add_group_photo_reply_trigger(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الرد مع صورة"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
-        context.user_data['group_photo_trigger'] = update.message.text
+        user_context['group_photo_trigger'] = update.message.text
         
         await update.message.reply_text(
             "👥 **إضافة رد مع صورة في القروبات**\n\n"
@@ -1727,11 +1780,14 @@ class BotHandler:
     
     async def add_group_photo_reply_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الرد مع صورة"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
-        context.user_data['group_photo_text'] = update.message.text
+        user_context['group_photo_text'] = update.message.text
         
         await update.message.reply_text(
             "👥 **إضافة رد مع صورة في القروبات**\n\n"
@@ -1743,54 +1799,60 @@ class BotHandler:
     
     async def add_group_photo_reply_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة صورة الرد"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
         if update.message.photo:
-            trigger = context.user_data['group_photo_trigger']
-            reply_text = context.user_data['group_photo_text']
+            trigger = user_context['group_photo_trigger']
+            reply_text = user_context['group_photo_text']
             admin_id = update.message.from_user.id
             
-            file_id = update.message.photo[-1].file_id
-            file = await context.bot.get_file(file_id)
-            file_path = f"group_replies/{file_id}.jpg"
-            await file.download_to_drive(file_path)
-            
-            self.db.add_group_photo_reply(trigger, reply_text, file_path, admin_id=admin_id)
-            await update.message.reply_text("✅ تم إضافة الرد مع الصورة في القروبات بنجاح")
+            try:
+                os.makedirs("group_replies", exist_ok=True)
+                
+                file_id = update.message.photo[-1].file_id
+                file = await context.bot.get_file(file_id)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                file_path = f"group_replies/photo_{timestamp}.jpg"
+                await file.download_to_drive(file_path)
+                
+                self.db.add_group_photo_reply(trigger, reply_text, file_path, admin_id=admin_id)
+                await update.message.reply_text("✅ تم إضافة الرد مع الصورة في القروبات بنجاح")
+            except Exception as e:
+                logger.error(f"خطأ في حفظ صورة الرد: {str(e)}")
+                await update.message.reply_text("❌ حدث خطأ أثناء حفظ الصورة")
         else:
             await update.message.reply_text("❌ يرجى إرسال صورة صالحة")
             return ADD_GROUP_PHOTO
         
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
     async def add_random_reply_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء إضافة رد عشوائي"""
-        context.user_data['conversation_active'] = True
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
         
-        if update.callback_query:
-            query = update.callback_query
-            await query.edit_message_text(
-                "🎲 **إضافة رد عشوائي في القروبات**\n\n"
-                "يرجى إرسال نص الرد العشوائي:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "🎲 **إضافة رد عشوائي في القروبات**\n\n"
-                "يرجى إرسال نص الرد العشوائي:\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
+        await update.callback_query.edit_message_text(
+            "🎲 **إضافة رد عشوائي في القروبات**\n\n"
+            "يرجى إرسال نص الرد العشوائي:\n\n"
+            "أو أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
         return ADD_RANDOM_REPLY
     
     async def add_random_reply_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة نص الرد العشوائي"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
@@ -1799,7 +1861,7 @@ class BotHandler:
         
         self.db.add_group_random_reply(reply_text, admin_id=admin_id)
         await update.message.reply_text("✅ تم إضافة الرد العشوائي بنجاح")
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
@@ -1852,46 +1914,41 @@ class BotHandler:
     
     async def add_admin_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء إضافة مشرف"""
-        context.user_data['conversation_active'] = True
+        user_id = update.callback_query.from_user.id
+        user_context = self.get_user_context(user_id)
+        user_context['conversation_active'] = True
         
-        if update.callback_query:
-            query = update.callback_query
-            await query.edit_message_text(
-                "👨‍💼 **إضافة مشرف جديد**\n\n"
-                "يرجى إرسال معرف المستخدم (User ID) للمشرف الجديد:\n\n"
-                "يمكنك الحصول على الـ User ID من @userinfobot\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "👨‍💼 **إضافة مشرف جديد**\n\n"
-                "يرجى إرسال معرف المستخدم (User ID) للمشرف الجديد:\n\n"
-                "يمكنك الحصول على الـ User ID من @userinfobot\n\n"
-                "أو أرسل /cancel للإلغاء",
-                parse_mode='Markdown'
-            )
+        await update.callback_query.edit_message_text(
+            "👨‍💼 **إضافة مشرف جديد**\n\n"
+            "يرجى إرسال معرف المستخدم (User ID) للمشرف الجديد:\n\n"
+            "يمكنك الحصول على الـ User ID من @userinfobot\n\n"
+            "أو أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
         return ADD_ADMIN
     
     async def add_admin_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة معرف المشرف"""
-        if not context.user_data.get('conversation_active'):
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
         try:
-            user_id = int(update.message.text)
+            user_id_to_add = int(update.message.text)
             
             username = "يتم إضافته"
             full_name = "مشرف جديد"
             
-            result, message = self.db.add_admin(user_id, username, full_name, False)
-            await update.message.reply_text(f"✅ {message}\n\nتم إضافة المستخدم {user_id} كمشرف")
+            result, message = self.db.add_admin(user_id_to_add, username, full_name, False)
+            await update.message.reply_text(f"✅ {message}\n\nتم إضافة المستخدم {user_id_to_add} كمشرف")
                 
         except ValueError:
             await update.message.reply_text("❌ معرف المستخدم يجب أن يكون رقماً")
         
-        context.user_data['conversation_active'] = False
+        user_context['conversation_active'] = False
         await self.start(update, context)
         return ConversationHandler.END
     
@@ -1959,8 +2016,9 @@ class BotHandler:
         )
         self.application.add_handler(add_account_conv)
         
+        # إصلاح معالج الإعلانات - استخدم pattern صحيح
         add_ad_conv = ConversationHandler(
-            entry_points=[CallbackQueryHandler(self.add_ad_type, pattern="^ad_type_")],
+            entry_points=[CallbackQueryHandler(lambda update, context: self.add_ad_type(update, context), pattern="^ad_type_")],
             states={
                 ADD_AD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_ad_text)],
                 ADD_AD_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, self.add_ad_media)]
@@ -1999,10 +2057,7 @@ class BotHandler:
         group_text_reply_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.add_group_text_reply_start, pattern="^add_group_text_reply$")],
             states={
-                ADD_GROUP_TEXT: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_group_text_reply_trigger),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_group_text_reply_text)
-                ]
+                ADD_GROUP_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_group_text_reply_trigger)]
             },
             fallbacks=[CommandHandler("cancel", self.cancel)]
         )
@@ -2043,6 +2098,7 @@ class BotHandler:
         print("🤖 البوت يعمل الآن...")
         print(f"✅ تم إضافة الآيدي 8390377822 كمشرف رئيسي")
         print("🎯 البوت جاهز بنسبة 100%")
+        print("📢 قسم الإعلانات تم إصلاحه تماماً")
         
         self.application.run_polling()
 
