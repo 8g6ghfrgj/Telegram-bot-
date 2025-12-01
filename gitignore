@@ -1,105 +1,19 @@
-# ===== Python =====
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# ===== Virtual Environments =====
-venv/
 env/
+venv/
+.venv/
 ENV/
 env.bak/
 venv.bak/
-
-# ===== Database =====
 *.db
 *.sqlite3
-*.db-journal
-*.sqlite
-bot_database.db
-
-# ===== Media Files =====
 ads/
 profile_photos/
 group_replies/
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.mp4
-*.avi
-*.mov
-*.pdf
-
-# ===== Environment Variables =====
-.env
-.env.local
-.env*.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# ===== Logs =====
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-lerna-debug.log*
-bot.log
-
-# ===== OS Files =====
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# ===== IDE Files =====
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-*.code-workspace
-
-# ===== Testing =====
-.coverage
-.tox/
-.nox/
-.pytest_cache/
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# ===== Jupyter Notebook =====
-.ipynb_checkpoints
-
-# ===== Distribution / Packaging =====
-*.manifest
-*.spec
-
-# ===== pipenv =====
-Pipfile.lock
-
-# ===== poetry =====
-poetry.lock
+.env
+*.log
