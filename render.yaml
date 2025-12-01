@@ -2,16 +2,15 @@ services:
   - type: web
     name: telegram-bot
     env: python
-    region: frankfurt
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    plan: free
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PORT
+        value: 8080
+    healthCheckPath: /health
     autoDeploy: true
-    healthCheckPath: /
-    disk:
-      name: data
-      mountPath: /opt/render/.data
-      sizeGB: 1
