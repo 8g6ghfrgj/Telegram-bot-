@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import random
 import threading
+import re
 from datetime import datetime
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -38,8 +39,8 @@ DB_NAME = "bot_database.db"
     ADD_ACCOUNT, ADD_AD_TYPE, ADD_AD_TEXT, ADD_AD_MEDIA, ADD_GROUP,
     ADD_PRIVATE_REPLY, ADD_GROUP_REPLY, ADD_ADMIN,
     ADD_USERNAME, ADD_RANDOM_REPLY, ADD_PRIVATE_TEXT, ADD_GROUP_TEXT,
-    ADD_GROUP_PHOTO, ADD_AD_VCF
-) = range(14)
+    ADD_GROUP_PHOTO, ADD_AD_VCF, ADD_SPECIAL_CONTACT
+) = range(15)
 
 # ==================== HTTP SERVER FOR RENDER ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -491,6 +492,16 @@ class TelegramBotManager:
         self.random_reply_thread = None
         self.lock = threading.Lock()
     
+    def extract_phone_number(self, text):
+        """استخراج رقم الهاتف من النص"""
+        # إزالة جميع الأحرف غير رقمية باستثناء +
+        phone = re.sub(r'[^\d\+]', '', text)
+        
+        # التحقق من صحة الرقم
+        if len(phone) >= 9 and ('+' in phone or phone.replace('+', '').isdigit()):
+            return phone
+        return None
+    
     async def test_session(self, session_string):
         """اختبار جلسة تيليجرام"""
         try:
@@ -608,6 +619,28 @@ class TelegramBotManager:
                                                             await client.send_file(dialog.id, media_path, caption="📞 جهة اتصال")
                                                         except:
                                                             continue
+                                                
+                                                elif ad_type == 'special_contact' and ad_text:
+                                                    # معالجة جهات الاتصال الخاصة
+                                                    try:
+                                                        # إرسال النص كما هو (بنفس الصيغة)
+                                                        await client.send_message(dialog.id, ad_text)
+                                                        
+                                                        # محاولة استخراج الرقم وإرساله كجهة اتصال فعلية
+                                                        phone_number = self.extract_phone_number(ad_text)
+                                                        if phone_number:
+                                                            # إرسال كجهة اتصال فعلية
+                                                            try:
+                                                                await client.send_contact(
+                                                                    dialog.id,
+                                                                    phone=phone_number,
+                                                                    first_name="جهة اتصال",
+                                                                    last_name=""
+                                                                )
+                                                            except:
+                                                                pass
+                                                    except Exception as e:
+                                                        continue
                                                 
                                                 elif ad_type in ['document', 'video', 'audio'] and media_path and os.path.exists(media_path):
                                                     await client.send_file(dialog.id, media_path, caption=ad_text)
@@ -903,6 +936,16 @@ class BotHandler:
             self.user_conversations[user_id] = {}
         return self.user_conversations[user_id]
     
+    def extract_phone_number(self, text):
+        """استخراج رقم الهاتف من النص"""
+        # إزالة جميع الأحرف غير رقمية باستثناء +
+        phone = re.sub(r'[^\d\+]', '', text)
+        
+        # التحقق من صحة الرقم
+        if len(phone) >= 9 and ('+' in phone or phone.replace('+', '').isdigit()):
+            return phone
+        return None
+    
     # ========== COMMAND HANDLERS ==========
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """بدء البوت"""
@@ -1011,6 +1054,15 @@ class BotHandler:
                 context.user_data['ad_type'] = ad_type
                 context.user_data['conversation_active'] = True
                 return ADD_AD_VCF
+            elif ad_type == 'special_contact':
+                await query.edit_message_text(
+                    f"📲 **إضافة جهة اتصال بصيغة خاصة**\n\nيرجى إرسال جهة الاتصال بصيغة:\n\nنسوي سكليف\nرقم الهاتف\nعرض جهة الاتصال\n\nأو أرسل /cancel للإلغاء",
+                    parse_mode='Markdown'
+                )
+                user_context['conversation_active'] = True
+                context.user_data['ad_type'] = ad_type
+                context.user_data['conversation_active'] = True
+                return ADD_SPECIAL_CONTACT
             else:
                 await query.edit_message_text(
                     f"📝 **إضافة نص الإعلان**\n\nيرجى إرسال نص الإعلان:\n\nأو أرسل /cancel للإلغاء",
@@ -1225,6 +1277,7 @@ class BotHandler:
             [InlineKeyboardButton("🖼️ صورة مع نص", callback_data="ad_type_photo")],
             [InlineKeyboardButton("📞 جهة اتصال يدوياً", callback_data="ad_type_contact")],
             [InlineKeyboardButton("📂 جهة اتصال (ملف VCF)", callback_data="ad_type_vcf")],
+            [InlineKeyboardButton("📲 جهة اتصال بصيغة خاصة", callback_data="ad_type_special_contact")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_ads")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1406,6 +1459,44 @@ class BotHandler:
         await self.start(update, context)
         return ConversationHandler.END
     
+    async def add_special_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """معالجة جهة اتصال بصيغة خاصة"""
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False) and not context.user_data.get('conversation_active', False):
+            await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
+            return ConversationHandler.END
+            
+        contact_text = update.message.text
+        admin_id = update.message.from_user.id
+        
+        # تحقق من وجود رقم هاتف في النص
+        phone_number = self.extract_phone_number(contact_text)
+        
+        if phone_number:
+            # تنظيف النص لضمان الصيغة الصحيحة
+            lines = contact_text.strip().split('\n')
+            if len(lines) < 3:
+                # إعادة بناء النص بالصيغة الصحيحة
+                name_part = lines[0] if len(lines) > 0 else "نسوي سكليف"
+                phone_part = phone_number
+                contact_text = f"{name_part}\n{phone_part}\nعرض جهة الاتصال"
+            
+            success = self.db.add_ad('special_contact', contact_text, admin_id=admin_id)
+            
+            if success:
+                await update.message.reply_text("✅ تم إضافة جهة الاتصال بصيغة خاصة بنجاح")
+            else:
+                await update.message.reply_text("❌ فشل إضافة جهة الاتصال")
+        else:
+            await update.message.reply_text("❌ لم يتم العثور على رقم هاتف صالح في النص. تأكد من الصيغة:\n\nنسوي سكليف\nرقم الهاتف\nعرض جهة الاتصال")
+        
+        user_context['conversation_active'] = False
+        context.user_data['conversation_active'] = False
+        await self.start(update, context)
+        return ConversationHandler.END
+    
     async def show_ads(self, query, context):
         """عرض الإعلانات"""
         admin_id = query.from_user.id
@@ -1420,9 +1511,10 @@ class BotHandler:
         
         for ad in ads:
             ad_id, ad_type, ad_text, media_path, file_type, contact_data_json, added_date, ad_admin_id = ad
-            type_emoji = {"text": "📝", "photo": "🖼️", "contact": "📞", "vcf": "📂"}
-
-            text += f"**#{ad_id}** - {type_emoji.get(ad_type, '📄')} {ad_type}\n"
+            type_emoji = {"text": "📝", "photo": "🖼️", "contact": "📞", "vcf": "📂", "special_contact": "📲"}
+            
+            emoji = type_emoji.get(ad_type, '📄')
+            text += f"**#{ad_id}** - {emoji} {ad_type}\n"
             
             if ad_type == 'text' and ad_text:
                 text += f"📋 {ad_text[:50]}...\n"
@@ -1436,7 +1528,16 @@ class BotHandler:
                     last_name = contact_data.get('last_name', '')
                     text += f"📞 {first_name} {last_name} - {phone}\n"
                 except:
-                    text += f"📞 جهة اتصال (VCF)\n"
+                    text += f"📞 جهة اتصال\n"
+            elif ad_type == 'special_contact' and ad_text:
+                # عرض جزء من نص جهة الاتصال الخاصة
+                lines = ad_text.split('\n')
+                if len(lines) >= 2:
+                    phone = self.extract_phone_number(ad_text)
+                    if phone:
+                        text += f"📲 {lines[0][:20]}... - {phone}\n"
+                    else:
+                        text += f"📲 {ad_text[:30]}...\n"
             
             text += "─" * 20 + "\n"
             
@@ -2014,11 +2115,70 @@ class BotHandler:
             parse_mode='Markdown'
         )
     
+    # ========== HANDLE MESSAGES (NEW) ==========
+    async def handle_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """معالجة جميع الرسائل (بما في ذلك جهات الاتصال)"""
+        user_id = update.effective_user.id
+        if not self.db.is_admin(user_id):
+            return
+        
+        message = update.message
+        
+        # إذا كانت الرسالة تحتوي على جهة اتصال
+        if message.contact:
+            contact = message.contact
+            
+            phone_number = contact.phone_number
+            first_name = contact.first_name or ""
+            last_name = contact.last_name or ""
+            
+            # إنشاء نص بنفس الصيغة المطلوبة
+            contact_text = f"نسوي سكليف\n{phone_number}\nعرض جهة الاتصال"
+            
+            # حفظ في قاعدة البيانات
+            self.db.add_ad('special_contact', contact_text, admin_id=user_id)
+            
+            await message.reply_text("✅ تم حفظ جهة الاتصال بصيغة خاصة")
+        
+        # إذا كانت الرسالة نصية وتحوي نمط جهة اتصال
+        elif message.text:
+            text = message.text.strip()
+            
+            # التحقق إذا كان النص يحتوي على نمط جهة اتصال
+            lines = text.split('\n')
+            
+            if len(lines) >= 2 and any(self.extract_phone_number(line) for line in lines):
+                # استخراج الرقم
+                phone_number = None
+                for line in lines:
+                    phone_number = self.extract_phone_number(line)
+                    if phone_number:
+                        break
+                
+                if phone_number:
+                    # تنظيف الرقم
+                    phone_number = re.sub(r'[^\d\+]', '', phone_number)
+                    if not phone_number.startswith('+'):
+                        phone_number = '+' + phone_number
+                    
+                    # إنشاء نص بنفس الصيغة
+                    name_part = lines[0] if len(lines) > 0 else "نسوي سكليف"
+                    contact_text = f"{name_part}\n{phone_number}\nعرض جهة الاتصال"
+                    
+                    # حفظ في قاعدة البيانات
+                    self.db.add_ad('special_contact', contact_text, admin_id=user_id)
+                    
+                    await message.reply_text("✅ تم حفظ جهة الاتصال بصيغة خاصة")
+    
     # ========== SETUP HANDLERS ==========
     def setup_handlers(self):
         """إعداد معالجات البوت"""
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("cancel", self.cancel))
+        
+        # معالج لجميع الرسائل النصية وجهات الاتصال
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_messages))
+        self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_messages))
         
         # معالجات المحادثة
         add_account_conv = ConversationHandler(
@@ -2047,6 +2207,13 @@ class BotHandler:
             fallbacks=[CommandHandler("cancel", self.cancel)]
         )
         self.application.add_handler(add_vcf_conv)
+        
+        add_special_contact_conv = ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.handle_callback, pattern="^ad_type_special_contact$")],
+            states={ADD_SPECIAL_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_special_contact)]},
+            fallbacks=[CommandHandler("cancel", self.cancel)]
+        )
+        self.application.add_handler(add_special_contact_conv)
         
         add_group_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.add_group_start, pattern="^add_group$")],
@@ -2118,6 +2285,7 @@ class BotHandler:
         print("💬 إدارة الردود تعمل بشكل كامل")
         print("👨‍💼 إدارة المشرفين تعمل بشكل كامل")
         print("👥 إدارة المجموعات تعمل بشكل كامل")
+        print("📲 دعم جهات الاتصال بصيغة خاصة (نسوي سكليف/رقم/عرض جهة الاتصال)")
         print("🌐 خادم HTTP يعمل على المنفذ 10000 لـ Render.com")
         
         self.application.run_polling()
