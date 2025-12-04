@@ -7,6 +7,7 @@ import random
 import threading
 from datetime import datetime
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -146,6 +147,18 @@ class BotDatabase:
                 status TEXT DEFAULT 'active',
                 last_publish DATETIME,
                 FOREIGN KEY (account_id) REFERENCES accounts (id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS publishing_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER,
+                group_id INTEGER,
+                ad_id INTEGER,
+                status TEXT,
+                message TEXT,
+                publish_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (account_id) REFERENCES accounts (id),
+                FOREIGN KEY (group_id) REFERENCES groups (id),
+                FOREIGN KEY (ad_id) REFERENCES ads (id)
             )'''
         ]
         
@@ -283,6 +296,20 @@ class BotDatabase:
             cursor.execute('SELECT * FROM groups WHERE admin_id = ? OR admin_id = 0 ORDER BY id', (admin_id,))
         else:
             cursor.execute('SELECT * FROM groups ORDER BY id')
+            
+        groups = cursor.fetchall()
+        conn.close()
+        return groups
+    
+    def get_pending_groups(self, admin_id=None):
+        """الحصول على المجموعات المعلقة فقط"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        if admin_id is not None:
+            cursor.execute("SELECT * FROM groups WHERE status = 'pending' AND (admin_id = ? OR admin_id = 0) ORDER BY id", (admin_id,))
+        else:
+            cursor.execute("SELECT * FROM groups WHERE status = 'pending' ORDER BY id")
             
         groups = cursor.fetchall()
         conn.close()
@@ -510,54 +537,41 @@ class TelegramBotManager:
             return False, None
     
     async def join_groups(self, admin_id=None):
-        """الانضمام إلى المجموعات"""
-        groups = self.db.get_groups(admin_id)
-        pending_groups = [g for g in groups if g[2] == 'pending']
+        """الانضمام إلى المجموعات - 3 مجموعات كل 3 دقائق"""
+        print("🚀 بدء عملية الانضمام إلى المجموعات...")
         
+        # الحصول على المجموعات المعلقة
+        pending_groups = self.db.get_pending_groups(admin_id)
+        
+        if not pending_groups:
+            print("✅ لا توجد مجموعات معلقة للانضمام")
+            return
+        
+        # الحصول على الحسابات النشطة
         accounts = self.db.get_active_publishing_accounts(admin_id)
         
-        for group in pending_groups:
-            group_id, group_link, status, join_date, added_date, group_admin_id = group
+        if not accounts:
+            print("❌ لا توجد حسابات نشطة للانضمام")
+            return
+        
+        print(f"📊 العثور على {len(pending_groups)} مجموعة معلقة و {len(accounts)} حساب نشط")
+        
+        # تقسيم المجموعات إلى مجموعات من 3
+        group_chunks = [pending_groups[i:i+3] for i in range(0, len(pending_groups), 3)]
+        
+        for chunk_index, group_chunk in enumerate(group_chunks):
+            print(f"\n📦 معالجة المجموعات {chunk_index * 3 + 1}-{chunk_index * 3 + len(group_chunk)} من {len(pending_groups)}")
             
-            for account in accounts:
-                account_id, session_string, name, username = account
+            # معالجة كل مجموعة في هذه الدفعة
+            for group in group_chunk:
+                group_id, group_link, status, join_date, added_date, group_admin_id = group
                 
-                try:
-                    client = TelegramClient(StringSession(session_string), 1, "b")
-                    await client.connect()
-                    
-                    if await client.is_user_authorized():
-                        try:
-                            if 't.me/+' in group_link:
-                                invite_hash = group_link.split('+')[1]
-                                await client(ImportChatInviteRequest(invite_hash))
-                            else:
-                                await client(JoinChannelRequest(group_link))
-                            
-                            self.db.update_group_status(group_id, 'joined')
-                            
-                        except Exception as e:
-                            self.db.update_group_status(group_id, 'failed')
-                    
-                    await client.disconnect()
-                    await asyncio.sleep(5)
-                    
-                except Exception as e:
-                    continue
-    
-    async def publish_to_groups(self, admin_id=None):
-        """النشر في المجموعات"""
-        while self.publishing_active:
-            try:
-                accounts = self.db.get_active_publishing_accounts(admin_id)
-                ads = self.db.get_ads(admin_id)
+                print(f"🔗 محاولة الانضمام إلى: {group_link}")
                 
-                if not accounts or not ads:
-                    await asyncio.sleep(60)
-                    continue
-                
+                # محاولة الانضمام بالحسابات المتاحة
+                joined = False
                 for account in accounts:
-                    if not self.publishing_active:
+                    if joined:
                         break
                     
                     account_id, session_string, name, username = account
@@ -567,101 +581,207 @@ class TelegramBotManager:
                         await client.connect()
                         
                         if await client.is_user_authorized():
-                            dialogs = await client.get_dialogs()
-                            
-                            for dialog in dialogs:
-                                if not self.publishing_active:
-                                    break
-                                
-                                if dialog.is_group or dialog.is_channel:
-                                    try:
-                                        for ad in ads:
-                                            if not self.publishing_active:
-                                                break
-                                            
-                                            ad_id, ad_type, ad_text, media_path, file_type, contact_data_json, added_date, ad_admin_id = ad
-                                            
-                                            try:
-                                                if ad_type == 'text':
-                                                    await client.send_message(dialog.id, ad_text)
-                                                
-                                                elif ad_type == 'photo' and media_path and os.path.exists(media_path):
-                                                    await client.send_file(dialog.id, media_path, caption=ad_text)
-                                                
-                                                elif ad_type == 'contact':
-                                                    if contact_data_json:
-                                                        try:
-                                                            contact_data = json.loads(contact_data_json)
-                                                            phone_number = contact_data.get('phone_number', '')
-                                                            first_name = contact_data.get('first_name', '')
-                                                            last_name = contact_data.get('last_name', '')
-                                                            
-                                                            if phone_number:
-                                                                # إرسال جهة اتصال فعلية
-                                                                contact_text = f"👤 **جهة اتصال**\n\n"
-                                                                contact_text += f"**الاسم:** {first_name} {last_name}\n"
-                                                                contact_text += f"**رقم الهاتف:** `{phone_number}`\n"
-                                                                contact_text += f"📞 للتواصل: `{phone_number}`\n\n"
-                                                                
-                                                                # محاولة إنشاء جهة اتصال باستخدام Telethon
-                                                                try:
-                                                                    contact = InputPhoneContact(
-                                                                        client_id=random.randint(0, 10000),
-                                                                        phone=phone_number,
-                                                                        first_name=first_name,
-                                                                        last_name=last_name or ""
-                                                                    )
-                                                                    
-                                                                    result = await client(ImportContactsRequest([contact]))
-                                                                    
-                                                                    if result and hasattr(result, 'users') and result.users:
-                                                                        contact_user = result.users[0]
-                                                                        # إرسال جهة الاتصال كملف اتصال
-                                                                        await client.send_contact(
-                                                                            dialog.id,
-                                                                            phone=phone_number,
-                                                                            first_name=first_name,
-                                                                            last_name=last_name or ""
-                                                                        )
-                                                                    else:
-                                                                        # إذا فشل، إرسال كنص
-                                                                        await client.send_message(dialog.id, contact_text)
-                                                                except Exception as e:
-                                                                    # إذا فشل إرسال جهة الاتصال، إرسال كنص
-                                                                    await client.send_message(dialog.id, contact_text)
-                                                        except Exception as e:
-                                                            # إذا فشل تحليل JSON، إرسال كنص بديل
-                                                            alt_text = "📞 **جهة اتصال**\n\nللاستفسار والتواصل 📱"
-                                                            await client.send_message(dialog.id, alt_text)
-                                                
-                                                elif ad_type in ['document', 'video', 'audio'] and media_path and os.path.exists(media_path):
-                                                    await client.send_file(dialog.id, media_path, caption=ad_text)
-                                                
-                                                await asyncio.sleep(2)
-                                            
-                                            except Exception as e:
-                                                continue
+                            try:
+                                # محاولة الانضمام
+                                if 't.me/+' in group_link:
+                                    invite_hash = group_link.split('+')[1]
+                                    await client(ImportChatInviteRequest(invite_hash))
+                                    self.db.update_group_status(group_id, 'joined')
+                                    print(f"✅ الحساب {name} انضم إلى المجموعة {group_link}")
+                                    joined = True
                                     
+                                else:
+                                    # محاولة الانضمام إلى قناة/مجموعة عادية
+                                    try:
+                                        await client(JoinChannelRequest(group_link))
+                                        self.db.update_group_status(group_id, 'joined')
+                                        print(f"✅ الحساب {name} انضم إلى المجموعة {group_link}")
+                                        joined = True
                                     except Exception as e:
-                                        continue
+                                        # محاولة أخرى بطريقة مختلفة
+                                        try:
+                                            entity = await client.get_entity(group_link)
+                                            await client(JoinChannelRequest(entity))
+                                            self.db.update_group_status(group_id, 'joined')
+                                            print(f"✅ الحساب {name} انضم إلى المجموعة {group_link}")
+                                            joined = True
+                                        except Exception as e2:
+                                            print(f"❌ فشل الانضمام بالحساب {name}: {e2}")
+                                
+                            except Exception as e:
+                                print(f"❌ فشل الانضمام بالحساب {name}: {e}")
                         
                         await client.disconnect()
-                    
+                        
                     except Exception as e:
+                        print(f"❌ خطأ في معالجة الحساب {name}: {e}")
                         continue
+                    
+                    # تأخير قصير بين محاولات الحسابات للمجموعة الواحدة
+                    await asyncio.sleep(2)
                 
-                await asyncio.sleep(60)
+                if not joined:
+                    self.db.update_group_status(group_id, 'failed')
+                    print(f"❌ فشل جميع الحسابات في الانضمام إلى {group_link}")
+                
+                # تأخير بين المجموعات في نفس الدفعة
+                await asyncio.sleep(5)
             
+            # إذا كانت هناك دفعات أخرى، انتظر 3 دقائق قبل الدفعة التالية
+            if chunk_index < len(group_chunks) - 1:
+                print(f"⏳ انتظار 3 دقائق قبل الدفعة التالية...")
+                await asyncio.sleep(180)  # 3 دقائق
+        
+        print("✅ اكتملت عملية الانضمام إلى جميع المجموعات")
+    
+    async def publish_to_groups(self, admin_id=None):
+        """النشر في المجموعات بجميع الحسابات بشكل متوازي"""
+        print("🚀 بدأ النشر التلقائي بجميع الحسابات...")
+        
+        while self.publishing_active:
+            try:
+                accounts = self.db.get_active_publishing_accounts(admin_id)
+                ads = self.db.get_ads(admin_id)
+                
+                if not accounts:
+                    print("⚠️ لا توجد حسابات نشطة للنشر")
+                    await asyncio.sleep(60)
+                    continue
+                
+                if not ads:
+                    print("⚠️ لا توجد إعلانات للنشر")
+                    await asyncio.sleep(60)
+                    continue
+                
+                print(f"📊 جاري النشر بـ {len(accounts)} حساب و {len(ads)} إعلان")
+                
+                # إنشاء مهام النشر لجميع الحسابات
+                tasks = []
+                for account in accounts:
+                    task = self.publish_with_account(account, ads)
+                    tasks.append(task)
+                
+                # تشغيل جميع المهام بشكل متوازي
+                await asyncio.gather(*tasks, return_exceptions=True)
+                
+                print(f"✅ اكتمل جولة النشر بجميع الحسابات")
+                
+                # انتظار فترة ثم إعادة النشر
+                await asyncio.sleep(300)  # 5 دقائق بين كل جولة نشر
+                
             except Exception as e:
+                print(f"❌ خطأ في النشر المتوازي: {e}")
                 await asyncio.sleep(60)
+    
+    async def publish_with_account(self, account, ads):
+        """النشر بحساب معين"""
+        account_id, session_string, name, username = account
+        
+        try:
+            client = TelegramClient(StringSession(session_string), 1, "b")
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                print(f"❌ الحساب {name} غير مفعل")
+                await client.disconnect()
+                return
+            
+            print(f"✅ الحساب {name} مفعل وجاهز للنشر")
+            
+            # الحصول على المجموعات التي انضم إليها الحساب
+            dialogs = await client.get_dialogs()
+            joined_groups = []
+            
+            for dialog in dialogs:
+                if dialog.is_group or dialog.is_channel:
+                    try:
+                        joined_groups.append(dialog)
+                    except:
+                        continue
+            
+            if not joined_groups:
+                print(f"⚠️ الحساب {name} ليس عضو في أي مجموعات")
+                await client.disconnect()
+                return
+            
+            print(f"📊 الحساب {name} عضو في {len(joined_groups)} مجموعة/قناة")
+            
+            # النشر في كل مجموعة
+            for group in joined_groups:
+                if not self.publishing_active:
+                    break
+                
+                # اختيار إعلان عشوائي للنشر
+                ad = random.choice(ads)
+                ad_id, ad_type, ad_text, media_path, file_type, contact_data_json, added_date, ad_admin_id = ad
+                
+                try:
+                    if ad_type == 'text':
+                        await client.send_message(group.id, ad_text)
+                        print(f"✅ {name} نشر نص في {group.title or group.id}")
+                    
+                    elif ad_type == 'photo' and media_path and os.path.exists(media_path):
+                        await client.send_file(group.id, media_path, caption=ad_text)
+                        print(f"✅ {name} نشر صورة في {group.title or group.id}")
+                    
+                    elif ad_type == 'contact' and contact_data_json:
+                        try:
+                            contact_data = json.loads(contact_data_json)
+                            phone_number = contact_data.get('phone_number', '')
+                            first_name = contact_data.get('first_name', '')
+                            last_name = contact_data.get('last_name', '')
+                            
+                            if phone_number:
+                                contact_text = f"👤 **جهة اتصال**\n\n"
+                                contact_text += f"**الاسم:** {first_name} {last_name}\n"
+                                contact_text += f"**رقم الهاتف:** `{phone_number}`\n"
+                                contact_text += f"📞 للتواصل: `{phone_number}`\n\n"
+                                
+                                # محاولة إرسال جهة اتصال
+                                try:
+                                    await client.send_contact(
+                                        group.id,
+                                        phone=phone_number,
+                                        first_name=first_name,
+                                        last_name=last_name or ""
+                                    )
+                                    print(f"✅ {name} نشر جهة اتصال في {group.title or group.id}")
+                                except:
+                                    # إذا فشل إرسال جهة الاتصال، إرسال كنص
+                                    await client.send_message(group.id, contact_text)
+                                    print(f"✅ {name} نشر نص جهة اتصال في {group.title or group.id}")
+                        except:
+                            alt_text = "📞 **جهة اتصال**\n\nللاستفسار والتواصل 📱"
+                            await client.send_message(group.id, alt_text)
+                            print(f"✅ {name} نشر جهة اتصال بديلة في {group.title or group.id}")
+                    
+                    elif ad_type in ['document', 'video', 'audio'] and media_path and os.path.exists(media_path):
+                        await client.send_file(group.id, media_path, caption=ad_text)
+                        print(f"✅ {name} نشر ملف في {group.title or group.id}")
+                    
+                    # تأخير بين المجموعات
+                    await asyncio.sleep(random.uniform(10, 30))
+                    
+                except Exception as e:
+                    print(f"❌ خطأ في النشر بالمجموعة {group.title or group.id} بالحساب {name}: {e}")
+                    continue
+            
+            await client.disconnect()
+            
+        except Exception as e:
+            print(f"❌ خطأ في معالجة الحساب {name}: {e}")
     
     def start_publishing(self, admin_id=None):
         """بدء النشر التلقائي"""
         with self.lock:
             if not self.publishing_active:
                 self.publishing_active = True
-                self.publishing_thread = Thread(target=lambda: asyncio.run(self.publish_to_groups(admin_id)))
+                self.publishing_thread = Thread(
+                    target=lambda: asyncio.run(self.publish_to_groups(admin_id)),
+                    daemon=True
+                )
                 self.publishing_thread.start()
+                print("✅ تم بدء النشر التلقائي بجميع الحسابات")
                 return True
         return False
     
@@ -670,6 +790,7 @@ class TelegramBotManager:
         with self.lock:
             if self.publishing_active:
                 self.publishing_active = False
+                print("⏹️ جاري إيقاف النشر التلقائي...")
                 if self.publishing_thread:
                     try:
                         self.publishing_thread.join(timeout=5)
@@ -1445,7 +1566,7 @@ class BotHandler:
         user_context['conversation_active'] = True
         
         await update.callback_query.edit_message_text(
-            "👥 **إضافة مجموعة جديدة**\n\nيرجى إرسال رابط المجموعة:\n\nأو أرسل /cancel للإلغاء",
+            "👥 **إضافة مجموعة جديدة**\n\nيرجى إرسال رابط المجموعة (يمكن إرسال عدة روابط في رسالة واحدة):\n\nأو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
         context.user_data['conversation_active'] = True
@@ -1464,16 +1585,29 @@ class BotHandler:
         admin_id = update.message.from_user.id
         
         added_count = 0
+        invalid_links = []
+        
         for link in group_links:
             if link.startswith('https://t.me/') or link.startswith('t.me/'):
                 self.db.add_group(link, admin_id)
                 added_count += 1
+            else:
+                invalid_links.append(link)
         
         if added_count > 0:
+            # بدء عملية الانضمام في خيط منفصل
             asyncio.create_task(self.manager.join_groups(admin_id))
-            await update.message.reply_text(f"✅ تم إضافة {added_count} مجموعة وبدأ عملية الانضمام")
+            response = f"✅ تم إضافة {added_count} مجموعة\n"
+            response += f"🚀 بدأت عملية الانضمام (3 مجموعات كل 3 دقائق)\n\n"
+            
+            if invalid_links:
+                response += f"❌ الروابط التالية غير صالحة:\n"
+                for invalid_link in invalid_links[:5]:  # عرض أول 5 روابط غير صالحة فقط
+                    response += f"- {invalid_link}\n"
+            
+            await update.message.reply_text(response)
         else:
-            await update.message.reply_text("❌ لم يتم إضافة أي مجموعة، تأكد من صحة الروابط")
+            await update.message.reply_text("❌ لم يتم إضافة أي مجموعة، تأكد من صحة الروابط\n\nيجب أن تبدأ الروابط بـ https://t.me/ أو t.me/")
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
@@ -1490,6 +1624,9 @@ class BotHandler:
             return
         
         text = "👥 **المجموعات المضافة:**\n\n"
+        pending_count = 0
+        joined_count = 0
+        failed_count = 0
         
         for group in groups:
             group_id, link, status, join_date, added_date, group_admin_id = group
@@ -1502,6 +1639,23 @@ class BotHandler:
                 text += f"تاريخ الانضمام: {join_date}\n"
             
             text += "─" * 20 + "\n"
+            
+            # إحصاءات
+            if status == 'pending':
+                pending_count += 1
+            elif status == 'joined':
+                joined_count += 1
+            elif status == 'failed':
+                failed_count += 1
+        
+        # إضافة الإحصاءات
+        stats = f"\n📊 **الإحصاءات:**\n"
+        stats += f"⏳ معلقة: {pending_count}\n"
+        stats += f"✅ منضمة: {joined_count}\n"
+        stats += f"❌ فشلت: {failed_count}\n"
+        stats += f"📋 المجموع: {len(groups)}"
+        
+        text += stats
         
         keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_groups")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1512,7 +1666,7 @@ class BotHandler:
         """بدء النشر التلقائي"""
         admin_id = query.from_user.id
         if self.manager.start_publishing(admin_id):
-            await query.edit_message_text("🚀 تم بدء النشر التلقائي في جميع الحسابات والمجموعات")
+            await query.edit_message_text("🚀 تم بدء النشر التلقائي في جميع الحسابات والمجموعات\n\n📢 البوت ينشر الآن بجميع الحسابات المتاحة")
         else:
             await query.edit_message_text("⚠️ النشر التلقائي يعمل بالفعل")
     
@@ -2067,16 +2221,18 @@ class BotHandler:
             self.db.add_admin(8294336757, "@user", "المشرف الرئيسي", True)
             print(f"✅ تم إضافة الآيدي 8294336757 كمشرف رئيسي")
         except:
-            print(f"⚠️  الآيدي 8390377822 مضاف مسبقاً كمشرف رئيسي")
+            print(f"⚠️ الآيدي 8294336757 مضاف مسبقاً كمشرف رئيسي")
         
         print("🤖 البوت يعمل الآن...")
         print("✅ جميع المشاكل تم إصلاحها")
         print("📢 إدارة الإعلانات تعمل بشكل كامل")
-        print("📞 جهات الاتصال تعمل بشكل صحيح (يدوياً)")
+        print("📞 جهات الاتصال تعمل بشكل صحيح")
         print("👥 إدارة الحسابات تعمل بشكل كامل")
         print("💬 إدارة الردود تعمل بشكل كامل")
         print("👨‍💼 إدارة المشرفين تعمل بشكل كامل")
         print("👥 إدارة المجموعات تعمل بشكل كامل")
+        print("⏰ نظام الانضمام: 3 مجموعات كل 3 دقائق")
+        print("🚀 النشر المتوازي: جميع الحسابات تنشر في نفس الوقت")
         print("🌐 خادم HTTP يعمل على المنفذ 10000 لـ Render.com")
         
         self.application.run_polling()
