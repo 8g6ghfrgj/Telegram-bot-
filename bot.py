@@ -865,7 +865,7 @@ class TelegramBotManager:
                     all_pending.append((g[0], g[2], 'bulk_group'))
                 
                 if not accounts or not all_pending:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)  # تقليل الانتظار إلى 5 ثواني فقط
                     continue
                 
                 for account in accounts:
@@ -900,19 +900,19 @@ class TelegramBotManager:
                                     self.db.update_bulk_group_status(group_id, 'failed')
                                 logger.warning(f"❌ فشل انضمام {name} إلى {group_link}")
                             
-                            # انتظار دقيقة واحدة بين كل رابط
-                            await asyncio.sleep(60)
+                            # انتظار 0.5 ثانية فقط بين كل رابط (أقصى سرعة)
+                            await asyncio.sleep(0.5)
                             
                         except Exception as e:
                             logger.error(f"خطأ في الحساب {name}: {str(e)}")
                             await self.cleanup_client(session_string)
                             continue
                 
-                await asyncio.sleep(60)  # الانتظار بين الدورات
+                await asyncio.sleep(5)  # الانتظار 5 ثواني بين الدورات (بدلاً من 60)
                 
             except Exception as e:
                 logger.error(f"خطأ في عملية الانضمام: {str(e)}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(5)
     
     async def join_single_group(self, client, group_link):
         """الانضمام إلى مجموعة واحدة"""
@@ -955,7 +955,7 @@ class TelegramBotManager:
                 
         except errors.FloodWaitError as e:
             logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
-            await asyncio.sleep(e.seconds + 5)
+            await asyncio.sleep(e.seconds + 1)  # تقليل وقت الانتظار الإضافي
             return False
         except errors.ChannelInvalidError:
             logger.error(f"❌ رابط غير صالح: {group_link}")
@@ -977,14 +977,14 @@ class TelegramBotManager:
             return False
     
     async def publish_to_groups_task(self, admin_id):
-        """مهمة النشر في المجموعات"""
+        """مهمة النشر في المجموعات - أقصى سرعة"""
         while self.publishing_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
                 ads = self.db.get_ads(admin_id)
                 
                 if not accounts or not ads:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(1)  # انتظار 1 ثانية فقط
                     continue
                 
                 # نشر من كل حساب
@@ -1000,7 +1000,7 @@ class TelegramBotManager:
                             continue
                         
                         # الحصول على جميع المجموعات التي انضم إليها الحساب
-                        dialogs = await client.get_dialogs(limit=100)
+                        dialogs = await client.get_dialogs(limit=200)  # زيادة الحد إلى 200
                         
                         for dialog in dialogs:
                             if not self.publishing_active.get(admin_id, False):
@@ -1023,25 +1023,38 @@ class TelegramBotManager:
                                                 await client.send_file(dialog.id, media_path, caption=ad_text)
                                                 logger.info(f"✅ نشر صورة في {dialog.name} بواسطة {name}")
                                             elif ad_type == 'contact' and media_path and os.path.exists(media_path):
-                                                await client.send_file(dialog.id, media_path)
-                                                logger.info(f"✅ نشر جهة اتصال في {dialog.name} بواسطة {name}")
+                                                # عند إرسال ملف VCF، تأكد من اسم الملف
+                                                if media_path.endswith('.vcf'):
+                                                    # تحميل الملف وإرساله باسم "تسوي سكليف صحتي واتساب.vcf"
+                                                    with open(media_path, 'rb') as f:
+                                                        await client.send_file(
+                                                            dialog.id, 
+                                                            f, 
+                                                            caption=ad_text,
+                                                            file_name="تسوي سكليف صحتي واتساب.vcf",
+                                                            allow_cache=False
+                                                        )
+                                                    logger.info(f"✅ نشر جهة اتصال في {dialog.name} بواسطة {name}")
+                                                else:
+                                                    await client.send_file(dialog.id, media_path)
+                                                    logger.info(f"✅ نشر ملف في {dialog.name} بواسطة {name}")
                                             elif media_path and os.path.exists(media_path):
                                                 await client.send_file(dialog.id, media_path, caption=ad_text)
                                                 logger.info(f"✅ نشر ملف في {dialog.name} بواسطة {name}")
                                             
-                                            # انتظار ثانية واحدة بين الإعلانات
-                                            await asyncio.sleep(1)
+                                            # انتظار 0.1 ثانية فقط بين الإعلانات (أقصى سرعة)
+                                            await asyncio.sleep(0.1)
                                             
                                         except errors.FloodWaitError as e:
                                             logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
-                                            await asyncio.sleep(e.seconds + 5)
+                                            await asyncio.sleep(e.seconds + 1)  # تقليل وقت الانتظار
                                             continue
                                         except Exception as e:
                                             logger.error(f"❌ فشل نشر الإعلان {ad_id}: {str(e)}")
                                             continue
                                     
-                                    # انتظار ثانية واحدة بين المجموعات
-                                    await asyncio.sleep(1)
+                                    # انتظار 0.2 ثانية فقط بين المجموعات (أقصى سرعة)
+                                    await asyncio.sleep(0.2)
                                     
                                 except Exception as e:
                                     logger.error(f"❌ فشل النشر في {dialog.name}: {str(e)}")
@@ -1052,22 +1065,22 @@ class TelegramBotManager:
                         await self.cleanup_client(session_string)
                         continue
                 
-                # الانتظار 30 ثانية قبل الدورة التالية
-                await asyncio.sleep(30)
+                # الانتظار 10 ثواني فقط قبل الدورة التالية (بدلاً من 30)
+                await asyncio.sleep(10)
                 
             except Exception as e:
                 logger.error(f"❌ خطأ في عملية النشر: {str(e)}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(10)
     
     async def handle_private_messages_task(self, admin_id):
-        """مهمة الرد على الرسائل الخاصة"""
+        """مهمة الرد على الرسائل الخاصة - أقصى سرعة"""
         while self.private_reply_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
                 private_replies = self.db.get_private_replies(admin_id)
                 
                 if not accounts or not private_replies:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(1)  # انتظار 1 ثانية فقط
                     continue
                 
                 for account in accounts:
@@ -1082,7 +1095,7 @@ class TelegramBotManager:
                             continue
                         
                         # الحصول على الرسائل الجديدة
-                        async for message in client.iter_messages(None, limit=10):
+                        async for message in client.iter_messages(None, limit=50):  # زيادة الحد إلى 50
                             if not self.private_reply_active.get(admin_id, False):
                                 break
                             
@@ -1093,11 +1106,11 @@ class TelegramBotManager:
                                         try:
                                             await client.send_message(message.sender_id, reply_text)
                                             logger.info(f"💬 رد على رسالة خاصة بواسطة {name}")
-                                            await asyncio.sleep(0.5)
+                                            await asyncio.sleep(0.05)  # انتظار 0.05 ثانية فقط
                                             break
                                         except errors.FloodWaitError as e:
                                             logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
-                                            await asyncio.sleep(e.seconds + 5)
+                                            await asyncio.sleep(e.seconds + 1)
                                             continue
                                         except Exception as e:
                                             logger.error(f"❌ فشل الرد: {str(e)}")
@@ -1108,15 +1121,15 @@ class TelegramBotManager:
                         await self.cleanup_client(session_string)
                         continue
                 
-                # الانتظار 10 ثواني قبل الدورة التالية
-                await asyncio.sleep(10)
+                # الانتظار 3 ثواني فقط قبل الدورة التالية
+                await asyncio.sleep(3)
                 
             except Exception as e:
                 logger.error(f"❌ خطأ في معالجة الرسائل الخاصة: {str(e)}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(5)
     
     async def handle_group_replies_task(self, admin_id):
-        """مهمة الردود في المجموعات"""
+        """مهمة الردود في المجموعات - أقصى سرعة"""
         while self.group_reply_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
@@ -1124,7 +1137,7 @@ class TelegramBotManager:
                 photo_replies = self.db.get_group_photo_replies(admin_id)
                 
                 if not accounts or (not text_replies and not photo_replies):
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(1)  # انتظار 1 ثانية فقط
                     continue
                 
                 for account in accounts:
@@ -1138,7 +1151,7 @@ class TelegramBotManager:
                         if not client:
                             continue
                         
-                        dialogs = await client.get_dialogs(limit=50)
+                        dialogs = await client.get_dialogs(limit=100)  # زيادة الحد إلى 100
                         
                         for dialog in dialogs:
                             if not self.group_reply_active.get(admin_id, False):
@@ -1146,7 +1159,7 @@ class TelegramBotManager:
                             
                             if dialog.is_group:
                                 try:
-                                    async for message in client.iter_messages(dialog.id, limit=5):
+                                    async for message in client.iter_messages(dialog.id, limit=10):  # زيادة الحد إلى 10
                                         if not self.group_reply_active.get(admin_id, False):
                                             break
                                         
@@ -1159,11 +1172,11 @@ class TelegramBotManager:
                                                     try:
                                                         await client.send_message(dialog.id, reply_text, reply_to=message.id)
                                                         logger.info(f"💬 رد على {trigger} في {dialog.name} بواسطة {name}")
-                                                        await asyncio.sleep(0.5)
+                                                        await asyncio.sleep(0.05)  # انتظار 0.05 ثانية فقط
                                                         break
                                                     except errors.FloodWaitError as e:
                                                         logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
-                                                        await asyncio.sleep(e.seconds + 5)
+                                                        await asyncio.sleep(e.seconds + 1)
                                                         continue
                                                     except Exception as e:
                                                         logger.error(f"❌ فشل الرد: {str(e)}")
@@ -1177,11 +1190,11 @@ class TelegramBotManager:
                                                     try:
                                                         await client.send_file(dialog.id, media_path, caption=reply_text, reply_to=message.id)
                                                         logger.info(f"🖼️ رد بصورة على {trigger} في {dialog.name} بواسطة {name}")
-                                                        await asyncio.sleep(0.5)
+                                                        await asyncio.sleep(0.05)  # انتظار 0.05 ثانية فقط
                                                         break
                                                     except errors.FloodWaitError as e:
                                                         logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
-                                                        await asyncio.sleep(e.seconds + 5)
+                                                        await asyncio.sleep(e.seconds + 1)
                                                         continue
                                                     except Exception as e:
                                                         logger.error(f"❌ فشل الرد: {str(e)}")
@@ -1196,22 +1209,22 @@ class TelegramBotManager:
                         await self.cleanup_client(session_string)
                         continue
                 
-                # الانتظار 10 ثواني قبل الدورة التالية
-                await asyncio.sleep(10)
+                # الانتظار 3 ثواني فقط قبل الدورة التالية
+                await asyncio.sleep(3)
                 
             except Exception as e:
                 logger.error(f"❌ خطأ في معالجة الردود الجماعية: {str(e)}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(5)
     
     async def handle_random_replies_task(self, admin_id):
-        """مهمة الردود العشوائية في القروبات"""
+        """مهمة الردود العشوائية في القروبات - أقصى سرعة"""
         while self.random_reply_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
                 random_replies = self.db.get_group_random_replies(admin_id)
                 
                 if not accounts or not random_replies:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(1)  # انتظار 1 ثانية فقط
                     continue
                 
                 for account in accounts:
@@ -1225,7 +1238,7 @@ class TelegramBotManager:
                         if not client:
                             continue
                         
-                        dialogs = await client.get_dialogs(limit=50)
+                        dialogs = await client.get_dialogs(limit=100)  # زيادة الحد إلى 100
                         
                         for dialog in dialogs:
                             if not self.random_reply_active.get(admin_id, False):
@@ -1233,7 +1246,7 @@ class TelegramBotManager:
                             
                             if dialog.is_group:
                                 try:
-                                    async for message in client.iter_messages(dialog.id, limit=3):
+                                    async for message in client.iter_messages(dialog.id, limit=5):  # زيادة الحد إلى 5
                                         if not self.random_reply_active.get(admin_id, False):
                                             break
                                         
@@ -1250,12 +1263,12 @@ class TelegramBotManager:
                                                         await client.send_message(dialog.id, reply_text, reply_to=message.id)
                                                         logger.info(f"🎲 رد عشوائي في {dialog.name} بواسطة {name}")
                                                     
-                                                    await asyncio.sleep(0.5)
+                                                    await asyncio.sleep(0.05)  # انتظار 0.05 ثانية فقط
                                                     break
                                                     
                                                 except errors.FloodWaitError as e:
                                                     logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
-                                                    await asyncio.sleep(e.seconds + 5)
+                                                    await asyncio.sleep(e.seconds + 1)
                                                     continue
                                                 except Exception as e:
                                                     logger.error(f"❌ فشل الرد العشوائي: {str(e)}")
@@ -1270,12 +1283,12 @@ class TelegramBotManager:
                         await self.cleanup_client(session_string)
                         continue
                 
-                # الانتظار 10 ثواني قبل الدورة التالية
-                await asyncio.sleep(10)
+                # الانتظار 3 ثواني فقط قبل الدورة التالية
+                await asyncio.sleep(3)
                 
             except Exception as e:
                 logger.error(f"❌ خطأ في معالجة الردود العشوائية: {str(e)}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(5)
     
     def start_publishing(self, admin_id):
         """بدء النشر التلقائي"""
@@ -1440,10 +1453,10 @@ class BotHandler:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "🚀 **لوحة تحكم البوت الفعلي**\n\n"
-            "✅ النشر يعمل فعلياً الآن\n"
-            "✅ الردود التلقائية تعمل\n"
-            "✅ الانضمام للمجموعات تلقائياً\n\n"
+            "🚀 **لوحة تحكم البوت الفعلي - السرعة القصوى**\n\n"
+            "⚡ النشر بأقصى سرعة ممكنة\n"
+            "⚡ الردود التلقائية بأقصى سرعة\n"
+            "⚡ الانضمام للمجموعات بأقصى سرعة\n\n"
             "اختر الإجراء الذي تريد تنفيذه:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
@@ -1640,10 +1653,10 @@ class BotHandler:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "🚀 **لوحة تحكم البوت الفعلي**\n\n"
-            "✅ النشر يعمل فعلياً الآن\n"
-            "✅ الردود التلقائية تعمل\n"
-            "✅ الانضمام للمجموعات تلقائياً\n\n"
+            "🚀 **لوحة تحكم البوت الفعلي - السرعة القصوى**\n\n"
+            "⚡ النشر بأقصى سرعة ممكنة\n"
+            "⚡ الردود التلقائية بأقصى سرعة\n"
+            "⚡ الانضمام للمجموعات بأقصى سرعة\n\n"
             "اختر الإجراء الذي تريد تنفيذه:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
@@ -1690,17 +1703,19 @@ class BotHandler:
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await query.edit_message_text(
-                "🚀 **تم بدء النشر الفعلي!**\n\n"
+                "🚀 **تم بدء النشر بأقصى سرعة!**\n\n"
                 f"✅ عدد الحسابات: {len(accounts)}\n"
                 f"✅ عدد الإعلانات: {len(ads)}\n"
-                f"⏰ السرعة: ثانية واحدة بين المجموعات\n\n"
-                "سيبدأ البوت بالنشر في جميع المجموعات الآن.",
+                f"⚡ السرعة: 0.1 ثانية بين الإعلانات\n"
+                f"⚡ 0.2 ثانية بين المجموعات\n"
+                f"⚡ 10 ثواني بين الدورات\n\n"
+                "سيبدأ البوت بالنشر في جميع المجموعات الآن بأقصى سرعة ممكنة.",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
             
             # تسجيل بدء النشر
-            logger.info(f"✅ بدأ النشر للمشرف {admin_id} بـ {len(accounts)} حساب و {len(ads)} إعلان")
+            logger.info(f"✅ بدأ النشر بأقصى سرعة للمشرف {admin_id} بـ {len(accounts)} حساب و {len(ads)} إعلان")
         else:
             await query.edit_message_text("⚠️ النشر يعمل بالفعل!")
     
@@ -1747,14 +1762,16 @@ class BotHandler:
             keyboard = [[InlineKeyboardButton("⏹️ إيقاف الرد", callback_data="stop_private_reply")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
-                "💬 **تم بدء الرد في الخاص!**\n\n"
+                "💬 **تم بدء الرد في الخاص بأقصى سرعة!**\n\n"
                 f"✅ عدد الحسابات: {len(accounts)}\n"
                 f"✅ عدد الردود: {len(replies)}\n"
-                "سيبدأ البوت بالرد على الرسائل الخاصة الآن.",
+                f"⚡ السرعة: 0.05 ثانية بين الردود\n"
+                f"⚡ 3 ثواني بين الدورات\n\n"
+                "سيبدأ البوت بالرد على الرسائل الخاصة الآن بأقصى سرعة ممكنة.",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
-            logger.info(f"💬 بدأ الرد في الخاص للمشرف {admin_id}")
+            logger.info(f"💬 بدأ الرد في الخاص بأقصى سرعة للمشرف {admin_id}")
         else:
             await query.edit_message_text("⚠️ الرد في الخاص يعمل بالفعل!")
     
@@ -1791,15 +1808,17 @@ class BotHandler:
             keyboard = [[InlineKeyboardButton("⏹️ إيقاف الرد", callback_data="stop_group_reply")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
-                "👥 **تم بدء الرد في القروبات!**\n\n"
+                "👥 **تم بدء الرد في القروبات بأقصى سرعة!**\n\n"
                 f"✅ عدد الحسابات: {len(accounts)}\n"
                 f"✅ عدد الردود النصية: {len(text_replies)}\n"
                 f"✅ عدد الردود مع الصور: {len(photo_replies)}\n"
-                "سيبدأ البوت بالرد على الرسائل في القروبات الآن.",
+                f"⚡ السرعة: 0.05 ثانية بين الردود\n"
+                f"⚡ 3 ثواني بين الدورات\n\n"
+                "سيبدأ البوت بالرد على الرسائل في القروبات الآن بأقصى سرعة ممكنة.",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
-            logger.info(f"👥 بدأ الرد في القروبات للمشرف {admin_id}")
+            logger.info(f"👥 بدأ الرد في القروبات بأقصى سرعة للمشرف {admin_id}")
         else:
             await query.edit_message_text("⚠️ الرد في القروبات يعمل بالفعل!")
     
@@ -1834,15 +1853,17 @@ class BotHandler:
             keyboard = [[InlineKeyboardButton("⏹️ إيقاف الرد العشوائي", callback_data="stop_random_reply")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
-                "🎲 **تم بدء الردود العشوائية!**\n\n"
+                "🎲 **تم بدء الردود العشوائية بأقصى سرعة!**\n\n"
                 f"✅ عدد الحسابات: {len(accounts)}\n"
                 f"✅ عدد الردود العشوائية: {len(random_replies)}\n"
-                "✅ الرد على 100% من الرسائل\n"
-                "سيبدأ البوت بالرد العشوائي في القروبات الآن.",
+                f"✅ الرد على 100% من الرسائل\n"
+                f"⚡ السرعة: 0.05 ثانية بين الردود\n"
+                f"⚡ 3 ثواني بين الدورات\n\n"
+                "سيبدأ البوت بالرد العشوائي في القروبات الآن بأقصى سرعة ممكنة.",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
-            logger.info(f"🎲 بدأ الرد العشوائي للمشرف {admin_id}")
+            logger.info(f"🎲 بدأ الرد العشوائي بأقصى سرعة للمشرف {admin_id}")
         else:
             await query.edit_message_text("⚠️ الرد العشوائي يعمل بالفعل!")
     
@@ -1882,15 +1903,16 @@ class BotHandler:
             keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_groups")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
-                "👥 **بدأ الانضمام إلى المجموعات!**\n\n"
+                "👥 **بدأ الانضمام إلى المجموعات بأقصى سرعة!**\n\n"
                 f"✅ عدد الحسابات: {len(accounts)}\n"
                 f"✅ عدد المجموعات المعلقة: {len(pending_groups) + len(pending_bulk_groups)}\n"
-                "⏰ الانتظار: دقيقة واحدة بين كل رابط\n\n"
-                "سيبدأ البوت بالانضمام إلى جميع المجموعات المعلقة الآن.",
+                f"⚡ الانتظار: 0.5 ثانية فقط بين كل رابط\n"
+                f"⚡ 5 ثواني بين الدورات\n\n"
+                "سيبدأ البوت بالانضمام إلى جميع المجموعات المعلقة الآن بأقصى سرعة ممكنة.",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
-            logger.info(f"👥 بدأ الانضمام للمجموعات للمشرف {admin_id}")
+            logger.info(f"👥 بدأ الانضمام للمجموعات بأقصى سرعة للمشرف {admin_id}")
         else:
             await query.edit_message_text("⚠️ عملية الانضمام تعمل بالفعل!")
     
@@ -2090,6 +2112,40 @@ class BotHandler:
             )
             return ADD_AD_MEDIA
     
+    def create_vcf_from_contact(self, contact):
+        """إنشاء ملف VCF من بيانات جهة الاتصال"""
+        try:
+            vcf_lines = []
+            vcf_lines.append("BEGIN:VCARD")
+            vcf_lines.append("VERSION:3.0")
+            
+            full_name = ""
+            if contact.first_name:
+                full_name += contact.first_name
+            if contact.last_name:
+                full_name += " " + contact.last_name
+            
+            if full_name.strip():
+                # تحديث اسم الملف ليكون: تسوي سكليف صحتي واتساب
+                vcf_lines.append(f"FN:تسوي سكليف صحتي واتساب")
+                vcf_lines.append(f"N:سكليف صحتي واتساب;تسوي;;;")
+            else:
+                vcf_lines.append(f"FN:تسوي سكليف صحتي واتساب")
+                vcf_lines.append(f"N:سكليف صحتي واتساب;تسوي;;;")
+            
+            if contact.phone_number:
+                vcf_lines.append(f"TEL;TYPE=CELL:{contact.phone_number}")
+            
+            if contact.user_id:
+                vcf_lines.append(f"X-TELEGRAM-ID:{contact.user_id}")
+            
+            vcf_lines.append("END:VCARD")
+            
+            return "\n".join(vcf_lines)
+        except Exception as e:
+            logger.error(f"خطأ في إنشاء VCF: {str(e)}")
+            return None
+    
     async def add_ad_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالجة ملف الإعلان"""
         user_id = update.message.from_user.id
@@ -2120,6 +2176,13 @@ class BotHandler:
             file_type = 'document'
             file_name = update.message.document.file_name
             mime_type = update.message.document.mime_type
+            
+            # إذا كان الملف هو VCF، غيّر نوع الإعلان إلى contact
+            if file_name and file_name.lower().endswith(('.vcf', '.vcard')):
+                ad_type = 'contact'
+            elif mime_type and 'vcard' in mime_type.lower():
+                ad_type = 'contact'
+                
         elif update.message.contact:
             contact = update.message.contact
             vcf_content = self.create_vcf_from_contact(contact)
@@ -2127,8 +2190,16 @@ class BotHandler:
             if vcf_content:
                 try:
                     os.makedirs("ads", exist_ok=True)
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    file_path = f"ads/contact_{timestamp}.vcf"
+                    # اسم الملف الثابت: تسوي سكليف صحتي واتساب.vcf
+                    file_path = "ads/تسوي سكليف صحتي واتساب.vcf"
+                    
+                    # إذا كان الملف موجوداً، أضف رقم نسخة
+                    counter = 1
+                    if os.path.exists(file_path):
+                        base_name = "تسوي سكليف صحتي واتساب"
+                        while os.path.exists(f"ads/{base_name}_{counter}.vcf"):
+                            counter += 1
+                        file_path = f"ads/{base_name}_{counter}.vcf"
                     
                     with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(vcf_content)
@@ -2149,10 +2220,6 @@ class BotHandler:
                     await update.message.reply_text("❌ حدث خطأ أثناء حفظ جهة الاتصال")
                     return ConversationHandler.END
         
-        if not file_id and not update.message.contact:
-            await update.message.reply_text("❌ يرجى إرسال صورة أو ملف VCF أو جهة اتصال")
-            return ADD_AD_MEDIA
-        
         if file_id:
             try:
                 os.makedirs("ads", exist_ok=True)
@@ -2160,25 +2227,22 @@ class BotHandler:
                 file = await context.bot.get_file(file_id)
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 
-                if file_type == 'photo':
+                if ad_type == 'contact':
+                    # اسم الملف لجهات الاتصال: تسوي سكليف صحتي واتساب.vcf
+                    file_path = "ads/تسوي سكليف صحتي واتساب.vcf"
+                    
+                    # إذا كان الملف موجوداً، أضف رقم نسخة
+                    counter = 1
+                    if os.path.exists(file_path):
+                        base_name = "تسوي سكليف صحتي واتساب"
+                        while os.path.exists(f"ads/{base_name}_{counter}.vcf"):
+                            counter += 1
+                        file_path = f"ads/{base_name}_{counter}.vcf"
+                elif file_type == 'photo':
                     file_path = f"ads/photo_{timestamp}.jpg"
-                elif file_type == 'document':
-                    is_vcf = False
-                    
-                    if file_name and file_name.lower().endswith(('.vcf', '.vcard')):
-                        is_vcf = True
-                    
-                    if mime_type and 'vcard' in mime_type.lower():
-                        is_vcf = True
-                    
-                    if is_vcf:
-                        file_path = f"ads/contact_{timestamp}.vcf"
-                        ad_type = 'contact'
-                    else:
-                        ext = file_name.split('.')[-1] if file_name else 'bin'
-                        file_path = f"ads/document_{timestamp}.{ext}"
                 else:
-                    file_path = f"ads/file_{timestamp}"
+                    ext = file_name.split('.')[-1] if file_name else 'bin'
+                    file_path = f"ads/document_{timestamp}.{ext}"
                 
                 await file.download_to_drive(file_path)
                 
@@ -2209,37 +2273,6 @@ class BotHandler:
         context.user_data['conversation_active'] = False
         return ConversationHandler.END
     
-    def create_vcf_from_contact(self, contact):
-        """إنشاء ملف VCF من بيانات جهة الاتصال"""
-        try:
-            vcf_lines = []
-            vcf_lines.append("BEGIN:VCARD")
-            vcf_lines.append("VERSION:3.0")
-            
-            full_name = ""
-            if contact.first_name:
-                full_name += contact.first_name
-            if contact.last_name:
-                full_name += " " + contact.last_name
-            
-            if full_name.strip():
-                vcf_lines.append(f"FN:{full_name.strip()}")
-                if contact.first_name:
-                    vcf_lines.append(f"N:{contact.last_name or ''};{contact.first_name};;;")
-            
-            if contact.phone_number:
-                vcf_lines.append(f"TEL;TYPE=CELL:{contact.phone_number}")
-            
-            if contact.user_id:
-                vcf_lines.append(f"X-TELEGRAM-ID:{contact.user_id}")
-            
-            vcf_lines.append("END:VCARD")
-            
-            return "\n".join(vcf_lines)
-        except Exception as e:
-            logger.error(f"خطأ في إنشاء VCF: {str(e)}")
-            return None
-    
     async def show_ads(self, query, context):
         """عرض الإعلانات"""
         admin_id = query.from_user.id
@@ -2265,7 +2298,7 @@ class BotHandler:
             elif ad_type == 'photo' and ad_text:
                 text += f"📋 {ad_text[:30]}... + صورة\n"
             elif ad_type == 'contact':
-                text += f"📞 جهة اتصال (VCF)\n"
+                text += f"📞 جهة اتصال (تسوي سكليف صحتي واتساب.vcf)\n"
             
             text += "─" * 20 + "\n"
             
@@ -2344,7 +2377,7 @@ class BotHandler:
             
             await update.message.reply_text(
                 f"✅ تم إضافة {added_count} مجموعة\n\n"
-                f"سيبدأ البوت بالانضمام إليها تلقائياً خلال دقيقة واحدة بين كل رابط.",
+                f"سيبدأ البوت بالانضمام إليها تلقائياً خلال 0.5 ثانية فقط بين كل رابط.",
                 reply_markup=reply_markup
             )
             
@@ -2359,7 +2392,7 @@ class BotHandler:
     
     async def delayed_join_groups(self, admin_id):
         """بدء الانضمام للمجموعات بعد تأخير"""
-        await asyncio.sleep(2)  # انتظار قصير للتأكد من حفظ البيانات
+        await asyncio.sleep(1)  # انتظار قصير للتأكد من حفظ البيانات
         self.manager.start_join_groups(admin_id)
     
     async def show_groups(self, query, context):
@@ -3191,16 +3224,18 @@ class BotHandler:
         except:
             print(f"⚠️  الآيدي 8294336757 مضاف مسبقاً كمشرف رئيسي")
         
-        print("🚀 **بوت النشر الفعلي يعمل الآن!**")
-        print("✅ تم إصلاح جميع المشاكل:")
-        print("   🔧 النشر يعمل فعلياً")
-        print("   🔧 الردود التلقائية تعمل")
-        print("   🔧 الانضمام للمجموعات يعمل")
-        print("   ⏰ دقيقة واحدة بين كل رابط")
-        print("   ⚡ ثانية واحدة بين المجموعات في النشر")
-        print("   ✅ معالجة أخطاء Flood Wait")
-        print("   🗑️ إمكانية حذف الردود")
-        print("   🔙 أزرار الرجوع في كل مكان")
+        print("🚀 **بوت النشر الفعلي - السرعة القصوى يعمل الآن!**")
+        print("✅ تم تعديل السرعات لتصبح أقصى ما يمكن:")
+        print("   ⚡ النشر: 0.1 ثانية بين الإعلانات")
+        print("   ⚡ النشر: 0.2 ثانية بين المجموعات")
+        print("   ⚡ النشر: 10 ثواني بين الدورات")
+        print("   ⚡ الرد الخاص: 0.05 ثانية بين الردود")
+        print("   ⚡ الرد الخاص: 3 ثواني بين الدورات")
+        print("   ⚡ الرد في القروبات: 0.05 ثانية بين الردود")
+        print("   ⚡ الرد العشوائي: 0.05 ثانية بين الردود")
+        print("   ⚡ الانضمام للمجموعات: 0.5 ثانية بين الروابط")
+        print("   ⚡ الانضمام للمجموعات: 5 ثواني بين الدورات")
+        print("   📁 اسم ملف جهات الاتصال: تسوي سكليف صحتي واتساب.vcf")
         
         self.application.run_polling()
 
@@ -3218,7 +3253,7 @@ if __name__ == "__main__":
     # تشغيل البوت
     try:
         bot = BotHandler()
-        print("🚀 Starting Telegram Bot with Fixed Publishing...")
+        print("🚀 Starting Telegram Bot with Maximum Speed Publishing...")
         bot.run()
     except Exception as e:
         print(f"❌ Error: {e}")
