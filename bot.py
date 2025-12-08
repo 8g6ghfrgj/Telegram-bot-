@@ -6,6 +6,8 @@ import sqlite3
 import random
 import string
 import threading
+import re
+import base64
 from datetime import datetime, timedelta
 from threading import Thread
 from queue import Queue
@@ -27,11 +29,12 @@ from telegram.ext import (
     ConversationHandler
 )
 
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.errors import SessionPasswordNeededError
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, GetDialogsRequest
+from telethon.tl.types import InputPeerEmpty, ChatEmpty
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 # خادم HTTP بسيط لمشكلة Port
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -68,8 +71,8 @@ DB_NAME = "bot_database.db"
     ADD_ACCOUNT, ADD_AD_TYPE, ADD_AD_TEXT, ADD_AD_MEDIA, ADD_GROUP, 
     ADD_PRIVATE_REPLY, ADD_GROUP_REPLY, ADD_ADMIN, 
     ADD_USERNAME, ADD_RANDOM_REPLY, ADD_PRIVATE_TEXT, ADD_GROUP_TEXT, 
-    ADD_GROUP_PHOTO
-) = range(13)
+    ADD_GROUP_PHOTO, DELETE_REPLY
+) = range(14)
 
 # تهيئة السجل
 logging.basicConfig(
@@ -77,6 +80,63 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+class TextEncoder:
+    """فئة لتشفير النصوص"""
+    
+    @staticmethod
+    def encode_text(text):
+        """تشفير النص باستخدام تقنيات متعددة"""
+        try:
+            # 1. Base64 Encoding
+            encoded = base64.b64encode(text.encode()).decode()
+            
+            # 2. Reverse text
+            reversed_text = text[::-1]
+            
+            # 3. XOR encoding with random key
+            key = random.randint(1, 255)
+            xor_encoded = ''.join(chr(ord(c) ^ key) for c in text)
+            
+            # 4. Combine multiple encodings
+            combined = f"B64:{encoded}|REV:{reversed_text}|XOR:{xor_encoded}|KEY:{key}"
+            
+            # 5. Additional Base64
+            final_encoded = base64.b64encode(combined.encode()).decode()
+            
+            return final_encoded
+            
+        except Exception as e:
+            logger.error(f"خطأ في تشفير النص: {str(e)}")
+            return text
+    
+    @staticmethod
+    def decode_text(encoded_text):
+        """فك تشفير النص"""
+        try:
+            # Decode from Base64
+            decoded = base64.b64decode(encoded_text.encode()).decode()
+            
+            # Extract parts
+            parts = {}
+            for part in decoded.split('|'):
+                if ':' in part:
+                    key, value = part.split(':', 1)
+                    parts[key] = value
+            
+            # Get original text from XOR
+            if 'XOR' in parts and 'KEY' in parts:
+                key = int(parts['KEY'])
+                xor_decoded = ''.join(chr(ord(c) ^ key) for c in parts['XOR'])
+                return xor_decoded
+            
+            # Fallback to base64
+            if 'B64' in parts:
+                return base64.b64decode(parts['B64']).decode()
+                
+            return decoded
+        except:
+            return encoded_text
 
 class BotDatabase:
     def __init__(self):
@@ -110,7 +170,8 @@ class BotDatabase:
                 media_path TEXT,
                 file_type TEXT,
                 added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                admin_id INTEGER DEFAULT 0
+                admin_id INTEGER DEFAULT 0,
+                is_encoded BOOLEAN DEFAULT 1
             )
         ''')
         
@@ -145,7 +206,8 @@ class BotDatabase:
                 reply_text TEXT,
                 is_active BOOLEAN DEFAULT 1,
                 added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                admin_id INTEGER DEFAULT 0
+                admin_id INTEGER DEFAULT 0,
+                is_encoded BOOLEAN DEFAULT 1
             )
         ''')
         
@@ -157,7 +219,8 @@ class BotDatabase:
                 reply_text TEXT,
                 is_active BOOLEAN DEFAULT 1,
                 added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                admin_id INTEGER DEFAULT 0
+                admin_id INTEGER DEFAULT 0,
+                is_encoded BOOLEAN DEFAULT 1
             )
         ''')
         
@@ -170,7 +233,8 @@ class BotDatabase:
                 media_path TEXT,
                 is_active BOOLEAN DEFAULT 1,
                 added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                admin_id INTEGER DEFAULT 0
+                admin_id INTEGER DEFAULT 0,
+                is_encoded BOOLEAN DEFAULT 1
             )
         ''')
         
@@ -179,9 +243,12 @@ class BotDatabase:
             CREATE TABLE IF NOT EXISTS group_random_replies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 reply_text TEXT,
+                media_path TEXT,
                 is_active BOOLEAN DEFAULT 1,
                 added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                admin_id INTEGER DEFAULT 0
+                admin_id INTEGER DEFAULT 0,
+                is_encoded BOOLEAN DEFAULT 1,
+                has_media BOOLEAN DEFAULT 0
             )
         ''')
         
@@ -193,6 +260,19 @@ class BotDatabase:
                 status TEXT DEFAULT 'active',
                 last_publish DATETIME,
                 FOREIGN KEY (account_id) REFERENCES accounts (id)
+            )
+        ''')
+        
+        # جدول المجموعات المجمعة
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bulk_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER,
+                link TEXT,
+                name TEXT,
+                status TEXT DEFAULT 'pending',
+                added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                admin_id INTEGER DEFAULT 0
             )
         ''')
         
@@ -270,10 +350,13 @@ class BotDatabase:
         cursor = conn.cursor()
         
         try:
+            # تشفير النص إذا كان موجوداً
+            encoded_text = TextEncoder.encode_text(text) if text else None
+            
             cursor.execute('''
-                INSERT INTO ads (type, text, media_path, file_type, admin_id)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (ad_type, text, media_path, file_type, admin_id))
+                INSERT INTO ads (type, text, media_path, file_type, admin_id, is_encoded)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (ad_type, encoded_text, media_path, file_type, admin_id, 1 if text else 0))
             
             conn.commit()
             return True
@@ -283,7 +366,7 @@ class BotDatabase:
         finally:
             conn.close()
     
-    def get_ads(self, admin_id=None):
+    def get_ads(self, admin_id=None, decode=True):
         """الحصول على جميع الإعلانات"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -295,6 +378,19 @@ class BotDatabase:
             
         ads = cursor.fetchall()
         conn.close()
+        
+        # فك تشفير النصوص إذا طُلب
+        if decode:
+            decoded_ads = []
+            for ad in ads:
+                ad_list = list(ad)
+                if ad_list[2] and ad_list[6]:  # النص وكان مشفراً
+                    try:
+                        ad_list[2] = TextEncoder.decode_text(ad_list[2])
+                    except:
+                        pass
+                decoded_ads.append(tuple(ad_list))
+            return decoded_ads
         return ads
     
     def delete_ad(self, ad_id, admin_id=None):
@@ -320,6 +416,50 @@ class BotDatabase:
             INSERT INTO groups (link, admin_id)
             VALUES (?, ?)
         ''', (link, admin_id))
+        
+        conn.commit()
+        conn.close()
+        return True
+    
+    def add_bulk_groups(self, groups_data, admin_id=0):
+        """إضافة مجموعات مجمعة"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        for link, name in groups_data:
+            cursor.execute('''
+                INSERT INTO bulk_groups (link, name, admin_id)
+                VALUES (?, ?, ?)
+            ''', (link, name, admin_id))
+        
+        conn.commit()
+        conn.close()
+        return True
+    
+    def get_bulk_groups(self, admin_id=None):
+        """الحصول على المجموعات المجمعة"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        if admin_id is not None:
+            cursor.execute('SELECT * FROM bulk_groups WHERE admin_id = ? OR admin_id = 0 ORDER BY id', (admin_id,))
+        else:
+            cursor.execute('SELECT * FROM bulk_groups ORDER BY id')
+            
+        groups = cursor.fetchall()
+        conn.close()
+        return groups
+    
+    def update_bulk_group_status(self, group_id, status):
+        """تحديث حالة المجموعة المجمعة"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE bulk_groups 
+            SET status = ?
+            WHERE id = ?
+        ''', (status, group_id))
         
         conn.commit()
         conn.close()
@@ -416,16 +556,18 @@ class BotDatabase:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
+        encoded_text = TextEncoder.encode_text(reply_text)
+        
         cursor.execute('''
-            INSERT INTO private_replies (reply_text, admin_id)
-            VALUES (?, ?)
-        ''', (reply_text, admin_id))
+            INSERT INTO private_replies (reply_text, admin_id, is_encoded)
+            VALUES (?, ?, ?)
+        ''', (encoded_text, admin_id, 1))
         
         conn.commit()
         conn.close()
         return True
     
-    def get_private_replies(self, admin_id=None):
+    def get_private_replies(self, admin_id=None, decode=True):
         """الحصول على الردود الخاصة"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -437,23 +579,52 @@ class BotDatabase:
             
         replies = cursor.fetchall()
         conn.close()
+        
+        # فك تشفير النصوص
+        if decode:
+            decoded_replies = []
+            for reply in replies:
+                reply_list = list(reply)
+                if reply_list[1] and reply_list[5]:  # النص وكان مشفراً
+                    try:
+                        reply_list[1] = TextEncoder.decode_text(reply_list[1])
+                    except:
+                        pass
+                decoded_replies.append(tuple(reply_list))
+            return decoded_replies
         return replies
+    
+    def delete_private_reply(self, reply_id, admin_id=None):
+        """حذف رد خاص"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        if admin_id:
+            cursor.execute('DELETE FROM private_replies WHERE id = ? AND (admin_id = ? OR admin_id = 0)', (reply_id, admin_id))
+        else:
+            cursor.execute('DELETE FROM private_replies WHERE id = ?', (reply_id,))
+            
+        conn.commit()
+        conn.close()
+        return True
     
     def add_group_text_reply(self, trigger, reply_text, admin_id=0):
         """إضافة رد نصي جماعي"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
+        encoded_reply = TextEncoder.encode_text(reply_text)
+        
         cursor.execute('''
-            INSERT INTO group_text_replies (trigger, reply_text, admin_id)
-            VALUES (?, ?, ?)
-        ''', (trigger, reply_text, admin_id))
+            INSERT INTO group_text_replies (trigger, reply_text, admin_id, is_encoded)
+            VALUES (?, ?, ?, ?)
+        ''', (trigger, encoded_reply, admin_id, 1))
         
         conn.commit()
         conn.close()
         return True
     
-    def get_group_text_replies(self, admin_id=None):
+    def get_group_text_replies(self, admin_id=None, decode=True):
         """الحصول على الردود النصية الجماعية"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -465,23 +636,52 @@ class BotDatabase:
             
         replies = cursor.fetchall()
         conn.close()
+        
+        # فك تشفير النصوص
+        if decode:
+            decoded_replies = []
+            for reply in replies:
+                reply_list = list(reply)
+                if reply_list[2] and reply_list[6]:  # النص وكان مشفراً
+                    try:
+                        reply_list[2] = TextEncoder.decode_text(reply_list[2])
+                    except:
+                        pass
+                decoded_replies.append(tuple(reply_list))
+            return decoded_replies
         return replies
+    
+    def delete_group_text_reply(self, reply_id, admin_id=None):
+        """حذف رد نصي جماعي"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        if admin_id:
+            cursor.execute('DELETE FROM group_text_replies WHERE id = ? AND (admin_id = ? OR admin_id = 0)', (reply_id, admin_id))
+        else:
+            cursor.execute('DELETE FROM group_text_replies WHERE id = ?', (reply_id,))
+            
+        conn.commit()
+        conn.close()
+        return True
     
     def add_group_photo_reply(self, trigger, reply_text, media_path, admin_id=0):
         """إضافة رد جماعي مع صورة"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
+        encoded_reply = TextEncoder.encode_text(reply_text) if reply_text else None
+        
         cursor.execute('''
-            INSERT INTO group_photo_replies (trigger, reply_text, media_path, admin_id)
-                VALUES (?, ?, ?, ?)
-            ''', (trigger, reply_text, media_path, admin_id))
+            INSERT INTO group_photo_replies (trigger, reply_text, media_path, admin_id, is_encoded)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (trigger, encoded_reply, media_path, admin_id, 1 if reply_text else 0))
         
         conn.commit()
         conn.close()
         return True
     
-    def get_group_photo_replies(self, admin_id=None):
+    def get_group_photo_replies(self, admin_id=None, decode=True):
         """الحصول على الردود الجماعية مع الصور"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -493,23 +693,52 @@ class BotDatabase:
             
         replies = cursor.fetchall()
         conn.close()
+        
+        # فك تشفير النصوص
+        if decode:
+            decoded_replies = []
+            for reply in replies:
+                reply_list = list(reply)
+                if reply_list[2] and reply_list[7]:  # النص وكان مشفراً
+                    try:
+                        reply_list[2] = TextEncoder.decode_text(reply_list[2])
+                    except:
+                        pass
+                decoded_replies.append(tuple(reply_list))
+            return decoded_replies
         return replies
     
-    def add_group_random_reply(self, reply_text, admin_id=0):
+    def delete_group_photo_reply(self, reply_id, admin_id=None):
+        """حذف رد جماعي مع صورة"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        if admin_id:
+            cursor.execute('DELETE FROM group_photo_replies WHERE id = ? AND (admin_id = ? OR admin_id = 0)', (reply_id, admin_id))
+        else:
+            cursor.execute('DELETE FROM group_photo_replies WHERE id = ?', (reply_id,))
+            
+        conn.commit()
+        conn.close()
+        return True
+    
+    def add_group_random_reply(self, reply_text, media_path=None, admin_id=0):
         """إضافة رد عشوائي في القروبات"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         
+        encoded_reply = TextEncoder.encode_text(reply_text) if reply_text else None
+        
         cursor.execute('''
-            INSERT INTO group_random_replies (reply_text, admin_id)
-            VALUES (?, ?)
-        ''', (reply_text, admin_id))
+            INSERT INTO group_random_replies (reply_text, media_path, admin_id, is_encoded, has_media)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (encoded_reply, media_path, admin_id, 1 if reply_text else 0, 1 if media_path else 0))
         
         conn.commit()
         conn.close()
         return True
     
-    def get_group_random_replies(self, admin_id=None):
+    def get_group_random_replies(self, admin_id=None, decode=True):
         """الحصول على الردود العشوائية في القروبات"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -521,7 +750,34 @@ class BotDatabase:
             
         replies = cursor.fetchall()
         conn.close()
+        
+        # فك تشفير النصوص
+        if decode:
+            decoded_replies = []
+            for reply in replies:
+                reply_list = list(reply)
+                if reply_list[1] and reply_list[6]:  # النص وكان مشفراً
+                    try:
+                        reply_list[1] = TextEncoder.decode_text(reply_list[1])
+                    except:
+                        pass
+                decoded_replies.append(tuple(reply_list))
+            return decoded_replies
         return replies
+    
+    def delete_group_random_reply(self, reply_id, admin_id=None):
+        """حذف رد عشوائي في القروبات"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        if admin_id:
+            cursor.execute('DELETE FROM group_random_replies WHERE id = ? AND (admin_id = ? OR admin_id = 0)', (reply_id, admin_id))
+        else:
+            cursor.execute('DELETE FROM group_random_replies WHERE id = ?', (reply_id,))
+            
+        conn.commit()
+        conn.close()
+        return True
     
     def get_active_publishing_accounts(self, admin_id=None):
         """الحصول على الحسابات النشطة للنشر"""
@@ -551,412 +807,600 @@ class BotDatabase:
 class TelegramBotManager:
     def __init__(self, db):
         self.db = db
-        self.publishing_active = False
-        self.publishing_thread = None
-        self.private_reply_active = False
-        self.private_reply_thread = None
-        self.group_reply_active = False
-        self.group_reply_thread = None
-        self.random_reply_active = False
-        self.random_reply_thread = None
+        self.publishing_active = {}
+        self.publishing_tasks = {}
+        self.private_reply_active = {}
+        self.private_reply_tasks = {}
+        self.group_reply_active = {}
+        self.group_reply_tasks = {}
+        self.random_reply_active = {}
+        self.random_reply_tasks = {}
+        self.join_groups_active = {}
+        self.join_groups_tasks = {}
+        self.client_cache = {}
         self.lock = threading.Lock()
     
-    async def test_session(self, session_string):
-        """اختبار جلسة تيليجرام"""
-        try:
-            client = TelegramClient(StringSession(session_string), 1, "b")
-            await client.connect()
-            
-            if await client.is_user_authorized():
-                me = await client.get_me()
-                await client.disconnect()
-                return True, me
-            else:
-                await client.disconnect()
-                return False, None
-        except Exception as e:
-            logger.error(f"خطأ في اختبار الجلسة: {str(e)}")
-            return False, None
+    async def get_client(self, session_string):
+        """الحصول على عميل من الذاكرة المؤقتة"""
+        if session_string not in self.client_cache:
+            try:
+                client = TelegramClient(StringSession(session_string), 1, "b")
+                await client.connect()
+                if await client.is_user_authorized():
+                    self.client_cache[session_string] = client
+                else:
+                    await client.disconnect()
+                    return None
+            except Exception as e:
+                logger.error(f"خطأ في الاتصال: {str(e)}")
+                return None
+        
+        return self.client_cache.get(session_string)
     
-    async def join_groups(self, admin_id=None):
-        """الانضمام إلى المجموعات"""
-        groups = self.db.get_groups(admin_id)
-        pending_groups = [g for g in groups if g[2] == 'pending']
-        
-        accounts = self.db.get_active_publishing_accounts(admin_id)
-        
-        for group in pending_groups:
-            group_id, group_link, status, join_date, added_date, group_admin_id = group
-            
-            for account in accounts:
-                account_id, session_string, name, username = account
+    async def cleanup_client(self, session_string):
+        """تنظيف العميل من الذاكرة المؤقتة"""
+        if session_string in self.client_cache:
+            try:
+                client = self.client_cache[session_string]
+                await client.disconnect()
+            except:
+                pass
+            del self.client_cache[session_string]
+    
+    async def join_groups_task(self, admin_id):
+        """مهمة الانضمام إلى المجموعات"""
+        while self.join_groups_active.get(admin_id, False):
+            try:
+                accounts = self.db.get_active_publishing_accounts(admin_id)
+                groups = self.db.get_groups(admin_id)
+                bulk_groups = self.db.get_bulk_groups(admin_id)
                 
-                try:
-                    client = TelegramClient(StringSession(session_string), 1, "b")
-                    await client.connect()
+                pending_groups = [g for g in groups if g[2] == 'pending']
+                pending_bulk_groups = [g for g in bulk_groups if g[4] == 'pending']
+                
+                all_pending = []
+                for g in pending_groups:
+                    all_pending.append((g[0], g[1], 'group'))
+                for g in pending_bulk_groups:
+                    all_pending.append((g[0], g[2], 'bulk_group'))
+                
+                if not accounts or not all_pending:
+                    await asyncio.sleep(60)
+                    continue
+                
+                for account in accounts:
+                    if not self.join_groups_active.get(admin_id, False):
+                        break
                     
-                    if await client.is_user_authorized():
+                    account_id, session_string, name, username = account
+                    
+                    for group_info in all_pending:
+                        if not self.join_groups_active.get(admin_id, False):
+                            break
+                        
+                        group_id, group_link, group_type = group_info
+                        
                         try:
-                            if 't.me/+' in group_link:
-                                invite_hash = group_link.split('+')[1]
-                                await client(ImportChatInviteRequest(invite_hash))
-                            else:
-                                await client(JoinChannelRequest(group_link))
+                            client = await self.get_client(session_string)
+                            if not client:
+                                continue
                             
-                            self.db.update_group_status(group_id, 'joined')
-                            logger.info(f"انضم الحساب {name} إلى المجموعة {group_link}")
+                            success = await self.join_single_group(client, group_link)
+                            
+                            if success:
+                                if group_type == 'group':
+                                    self.db.update_group_status(group_id, 'joined')
+                                else:
+                                    self.db.update_bulk_group_status(group_id, 'joined')
+                                logger.info(f"✅ انضم الحساب {name} إلى المجموعة {group_link}")
+                            else:
+                                if group_type == 'group':
+                                    self.db.update_group_status(group_id, 'failed')
+                                else:
+                                    self.db.update_bulk_group_status(group_id, 'failed')
+                                logger.warning(f"❌ فشل انضمام {name} إلى {group_link}")
+                            
+                            # انتظار دقيقة واحدة بين كل رابط
+                            await asyncio.sleep(60)
                             
                         except Exception as e:
-                            logger.error(f"فشل الانضمام للمجموعة {group_link}: {str(e)}")
-                            self.db.update_group_status(group_id, 'failed')
-                    
-                    await client.disconnect()
-                    await asyncio.sleep(5)
-                    
-                except Exception as e:
-                    logger.error(f"خطأ في الحساب {name}: {str(e)}")
-                    continue
+                            logger.error(f"خطأ في الحساب {name}: {str(e)}")
+                            await self.cleanup_client(session_string)
+                            continue
+                
+                await asyncio.sleep(60)  # الانتظار بين الدورات
+                
+            except Exception as e:
+                logger.error(f"خطأ في عملية الانضمام: {str(e)}")
+                await asyncio.sleep(60)
     
-    async def publish_to_groups(self, admin_id=None):
-        """النشر في المجموعات"""
-        while self.publishing_active:
+    async def join_single_group(self, client, group_link):
+        """الانضمام إلى مجموعة واحدة"""
+        try:
+            # تنظيف الرابط
+            if group_link.startswith('https://'):
+                group_link = group_link.replace('https://', '')
+            
+            if group_link.startswith('t.me/'):
+                group_link = group_link.replace('t.me/', '')
+            
+            # التعامل مع أنواع الروابط المختلفة
+            if group_link.startswith('+') or 'joinchat' in group_link:
+                # رابط دعوة
+                if group_link.startswith('+'):
+                    invite_hash = group_link[1:]
+                else:
+                    invite_hash = group_link.split('/')[-1]
+                
+                await client(ImportChatInviteRequest(invite_hash))
+                return True
+                
+            elif 'addlist' in group_link:
+                # رابط قائمة (مجلد)
+                folder_hash = group_link.split('/')[-1]
+                try:
+                    await client(ImportChatInviteRequest(folder_hash))
+                    return True
+                except:
+                    # محاولة كرابط عادي
+                    try:
+                        await client(JoinChannelRequest(f'@{folder_hash}'))
+                        return True
+                    except:
+                        return False
+            else:
+                # رابط عادي
+                await client(JoinChannelRequest(f'@{group_link}'))
+                return True
+                
+        except errors.FloodWaitError as e:
+            logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
+            await asyncio.sleep(e.seconds + 5)
+            return False
+        except errors.ChannelInvalidError:
+            logger.error(f"❌ رابط غير صالح: {group_link}")
+            return False
+        except errors.ChannelPrivateError:
+            logger.error(f"🔒 القناة خاصة: {group_link}")
+            return False
+        except errors.InviteHashExpiredError:
+            logger.error(f"⏰ رابط منتهي: {group_link}")
+            return False
+        except errors.InviteHashInvalidError:
+            logger.error(f"❌ رابط غير صالح: {group_link}")
+            return False
+        except errors.UserAlreadyParticipantError:
+            logger.info(f"✅ مستخدم بالفعل في المجموعة: {group_link}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ خطأ في الانضمام: {str(e)}")
+            return False
+    
+    async def publish_to_groups_task(self, admin_id):
+        """مهمة النشر في المجموعات"""
+        while self.publishing_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
                 ads = self.db.get_ads(admin_id)
                 
                 if not accounts or not ads:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)
                     continue
                 
+                # نشر من كل حساب
                 for account in accounts:
-                    if not self.publishing_active:
+                    if not self.publishing_active.get(admin_id, False):
                         break
-                        
+                    
                     account_id, session_string, name, username = account
                     
                     try:
-                        client = TelegramClient(StringSession(session_string), 1, "b")
-                        await client.connect()
+                        client = await self.get_client(session_string)
+                        if not client:
+                            continue
                         
-                        if await client.is_user_authorized():
-                            dialogs = await client.get_dialogs()
+                        # الحصول على جميع المجموعات التي انضم إليها الحساب
+                        dialogs = await client.get_dialogs(limit=100)
+                        
+                        for dialog in dialogs:
+                            if not self.publishing_active.get(admin_id, False):
+                                break
                             
-                            for dialog in dialogs:
-                                if not self.publishing_active:
-                                    break
-                                    
-                                if dialog.is_group or dialog.is_channel:
-                                    try:
-                                        for ad in ads:
-                                            if not self.publishing_active:
-                                                break
-                                                
-                                            ad_id, ad_type, ad_text, media_path, file_type, added_date, ad_admin_id = ad
+                            if dialog.is_group or dialog.is_channel:
+                                try:
+                                    # نشر جميع الإعلانات في هذه المجموعة
+                                    for ad in ads:
+                                        if not self.publishing_active.get(admin_id, False):
+                                            break
+                                        
+                                        ad_id, ad_type, ad_text, media_path, file_type, added_date, ad_admin_id, is_encoded = ad
+                                        
+                                        try:
+                                            if ad_type == 'text':
+                                                await client.send_message(dialog.id, ad_text)
+                                                logger.info(f"✅ نشر نص في {dialog.name} بواسطة {name}")
+                                            elif ad_type == 'photo' and media_path and os.path.exists(media_path):
+                                                await client.send_file(dialog.id, media_path, caption=ad_text)
+                                                logger.info(f"✅ نشر صورة في {dialog.name} بواسطة {name}")
+                                            elif ad_type == 'contact' and media_path and os.path.exists(media_path):
+                                                await client.send_file(dialog.id, media_path)
+                                                logger.info(f"✅ نشر جهة اتصال في {dialog.name} بواسطة {name}")
+                                            elif media_path and os.path.exists(media_path):
+                                                await client.send_file(dialog.id, media_path, caption=ad_text)
+                                                logger.info(f"✅ نشر ملف في {dialog.name} بواسطة {name}")
                                             
-                                            try:
-                                                if ad_type == 'text':
-                                                    await client.send_message(dialog.id, ad_text)
-                                                elif ad_type == 'photo' and media_path and os.path.exists(media_path):
-                                                    await client.send_file(dialog.id, media_path, caption=ad_text)
-                                                elif ad_type == 'contact' and media_path and os.path.exists(media_path):
-                                                    # إرسال ملف جهة الاتصال بدون نص
-                                                    await client.send_file(dialog.id, media_path)
-                                                elif media_path and os.path.exists(media_path):
-                                                    await client.send_file(dialog.id, media_path, caption=ad_text)
-                                                
-                                                logger.info(f"تم النشر في {dialog.name} بواسطة {name}")
-                                                await asyncio.sleep(2)
-                                                
-                                            except Exception as e:
-                                                logger.error(f"فشل نشر الإعلان {ad_id} في {dialog.name}: {str(e)}")
-                                                continue
-                                                
-                                    except Exception as e:
-                                        logger.error(f"فشل النشر في {dialog.name}: {str(e)}")
-                                        continue
-                        
-                        await client.disconnect()
+                                            # انتظار ثانية واحدة بين الإعلانات
+                                            await asyncio.sleep(1)
+                                            
+                                        except errors.FloodWaitError as e:
+                                            logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
+                                            await asyncio.sleep(e.seconds + 5)
+                                            continue
+                                        except Exception as e:
+                                            logger.error(f"❌ فشل نشر الإعلان {ad_id}: {str(e)}")
+                                            continue
+                                    
+                                    # انتظار ثانية واحدة بين المجموعات
+                                    await asyncio.sleep(1)
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ فشل النشر في {dialog.name}: {str(e)}")
+                                    continue
                         
                     except Exception as e:
-                        logger.error(f"خطأ في الحساب {name}: {str(e)}")
+                        logger.error(f"❌ خطأ في الحساب {name}: {str(e)}")
+                        await self.cleanup_client(session_string)
                         continue
                 
-                await asyncio.sleep(60)
+                # الانتظار 30 ثانية قبل الدورة التالية
+                await asyncio.sleep(30)
                 
             except Exception as e:
-                logger.error(f"خطأ في عملية النشر: {str(e)}")
+                logger.error(f"❌ خطأ في عملية النشر: {str(e)}")
                 await asyncio.sleep(60)
     
-    def start_publishing(self, admin_id=None):
-        """بدء النشر التلقائي"""
-        with self.lock:
-            if not self.publishing_active:
-                self.publishing_active = True
-                self.publishing_thread = Thread(target=lambda: asyncio.run(self.publish_to_groups(admin_id)))
-                self.publishing_thread.start()
-                return True
-        return False
-    
-    def stop_publishing(self):
-        """إيقاف النشر التلقائي"""
-        with self.lock:
-            if self.publishing_active:
-                self.publishing_active = False
-                if self.publishing_thread:
-                    try:
-                        self.publishing_thread.join(timeout=5)
-                    except:
-                        pass
-                return True
-        return False
-    
-    async def handle_private_messages(self, admin_id=None):
-        """معالجة الرسائل الخاصة"""
-        while self.private_reply_active:
+    async def handle_private_messages_task(self, admin_id):
+        """مهمة الرد على الرسائل الخاصة"""
+        while self.private_reply_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
                 private_replies = self.db.get_private_replies(admin_id)
                 
                 if not accounts or not private_replies:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)
                     continue
                 
                 for account in accounts:
-                    if not self.private_reply_active:
+                    if not self.private_reply_active.get(admin_id, False):
                         break
-                        
+                    
                     account_id, session_string, name, username = account
                     
                     try:
-                        client = TelegramClient(StringSession(session_string), 1, "b")
-                        await client.connect()
+                        client = await self.get_client(session_string)
+                        if not client:
+                            continue
                         
-                        if await client.is_user_authorized():
-                            async for message in client.iter_messages(None, limit=5):
-                                if not self.private_reply_active:
-                                    break
-                                    
-                                if message.is_private and not message.out:
-                                    for reply in private_replies:
-                                        reply_id, reply_text, is_active, added_date, reply_admin_id = reply
-                                        if is_active:
+                        # الحصول على الرسائل الجديدة
+                        async for message in client.iter_messages(None, limit=10):
+                            if not self.private_reply_active.get(admin_id, False):
+                                break
+                            
+                            if message.is_private and not message.out:
+                                for reply in private_replies:
+                                    reply_id, reply_text, is_active, added_date, reply_admin_id, is_encoded = reply
+                                    if is_active:
+                                        try:
                                             await client.send_message(message.sender_id, reply_text)
-                                            logger.info(f"تم الرد على رسالة خاصة بواسطة {name}")
-                                            await asyncio.sleep(1)
+                                            logger.info(f"💬 رد على رسالة خاصة بواسطة {name}")
+                                            await asyncio.sleep(0.5)
                                             break
-                        
-                        await client.disconnect()
+                                        except errors.FloodWaitError as e:
+                                            logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
+                                            await asyncio.sleep(e.seconds + 5)
+                                            continue
+                                        except Exception as e:
+                                            logger.error(f"❌ فشل الرد: {str(e)}")
+                                            continue
                         
                     except Exception as e:
-                        logger.error(f"خطأ في الحساب {name}: {str(e)}")
+                        logger.error(f"❌ خطأ في الحساب {name}: {str(e)}")
+                        await self.cleanup_client(session_string)
                         continue
                 
+                # الانتظار 10 ثواني قبل الدورة التالية
                 await asyncio.sleep(10)
                 
             except Exception as e:
-                logger.error(f"خطأ في معالجة الرسائل الخاصة: {str(e)}")
+                logger.error(f"❌ خطأ في معالجة الرسائل الخاصة: {str(e)}")
                 await asyncio.sleep(30)
     
-    def start_private_reply(self, admin_id=None):
-        """بدء الرد على الرسائل الخاصة"""
-        with self.lock:
-            if not self.private_reply_active:
-                self.private_reply_active = True
-                self.private_reply_thread = Thread(target=lambda: asyncio.run(self.handle_private_messages(admin_id)))
-                self.private_reply_thread.start()
-                return True
-        return False
-    
-    def stop_private_reply(self):
-        """إيقاف الرد على الرسائل الخاصة"""
-        with self.lock:
-            if self.private_reply_active:
-                self.private_reply_active = False
-                if self.private_reply_thread:
-                    try:
-                        self.private_reply_thread.join(timeout=5)
-                    except:
-                        pass
-                return True
-        return False
-    
-    async def handle_group_replies(self, admin_id=None):
-        """معالجة الردود في المجموعات"""
-        while self.group_reply_active:
+    async def handle_group_replies_task(self, admin_id):
+        """مهمة الردود في المجموعات"""
+        while self.group_reply_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
                 text_replies = self.db.get_group_text_replies(admin_id)
                 photo_replies = self.db.get_group_photo_replies(admin_id)
                 
                 if not accounts or (not text_replies and not photo_replies):
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)
                     continue
                 
                 for account in accounts:
-                    if not self.group_reply_active:
+                    if not self.group_reply_active.get(admin_id, False):
                         break
-                        
+                    
                     account_id, session_string, name, username = account
                     
                     try:
-                        client = TelegramClient(StringSession(session_string), 1, "b")
-                        await client.connect()
+                        client = await self.get_client(session_string)
+                        if not client:
+                            continue
                         
-                        if await client.is_user_authorized():
-                            dialogs = await client.get_dialogs()
+                        dialogs = await client.get_dialogs(limit=50)
+                        
+                        for dialog in dialogs:
+                            if not self.group_reply_active.get(admin_id, False):
+                                break
                             
-                            for dialog in dialogs:
-                                if not self.group_reply_active:
-                                    break
-                                    
-                                if dialog.is_group:
-                                    try:
-                                        async for message in client.iter_messages(dialog.id, limit=5):
-                                            if not self.group_reply_active:
-                                                break
-                                                
-                                            if message.text and not message.out:
-                                                # الردود النصية
-                                                for reply in text_replies:
-                                                    reply_id, trigger, reply_text, is_active, added_date, reply_admin_id = reply
-                                                    
-                                                    if is_active and trigger.lower() in message.text.lower():
-                                                        await client.send_message(dialog.id, reply_text, reply_to=message.id)
-                                                        logger.info(f"تم الرد على رسالة في {dialog.name} بواسطة {name}")
-                                                        await asyncio.sleep(1)
-                                                        break
-                                                
-                                                # الردود مع الصور
-                                                for reply in photo_replies:
-                                                    reply_id, trigger, reply_text, media_path, is_active, added_date, reply_admin_id = reply
-                                                    
-                                                    if is_active and trigger.lower() in message.text.lower() and os.path.exists(media_path):
-                                                        await client.send_file(dialog.id, media_path, caption=reply_text, reply_to=message.id)
-                                                        logger.info(f"تم الرد بصورة على رسالة في {dialog.name} بواسطة {name}")
-                                                        await asyncio.sleep(1)
-                                                        break
+                            if dialog.is_group:
+                                try:
+                                    async for message in client.iter_messages(dialog.id, limit=5):
+                                        if not self.group_reply_active.get(admin_id, False):
+                                            break
                                         
-                                    except Exception as e:
-                                        logger.error(f"فشل الرد في {dialog.name}: {str(e)}")
-                                        continue
-                        
-                        await client.disconnect()
+                                        if message.text and not message.out:
+                                            # الردود النصية
+                                            for reply in text_replies:
+                                                reply_id, trigger, reply_text, is_active, added_date, reply_admin_id, is_encoded = reply
+                                                
+                                                if is_active and trigger.lower() in message.text.lower():
+                                                    try:
+                                                        await client.send_message(dialog.id, reply_text, reply_to=message.id)
+                                                        logger.info(f"💬 رد على {trigger} في {dialog.name} بواسطة {name}")
+                                                        await asyncio.sleep(0.5)
+                                                        break
+                                                    except errors.FloodWaitError as e:
+                                                        logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
+                                                        await asyncio.sleep(e.seconds + 5)
+                                                        continue
+                                                    except Exception as e:
+                                                        logger.error(f"❌ فشل الرد: {str(e)}")
+                                                        continue
+                                            
+                                            # الردود مع الصور
+                                            for reply in photo_replies:
+                                                reply_id, trigger, reply_text, media_path, is_active, added_date, reply_admin_id, is_encoded = reply
+                                                
+                                                if is_active and trigger.lower() in message.text.lower() and os.path.exists(media_path):
+                                                    try:
+                                                        await client.send_file(dialog.id, media_path, caption=reply_text, reply_to=message.id)
+                                                        logger.info(f"🖼️ رد بصورة على {trigger} في {dialog.name} بواسطة {name}")
+                                                        await asyncio.sleep(0.5)
+                                                        break
+                                                    except errors.FloodWaitError as e:
+                                                        logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
+                                                        await asyncio.sleep(e.seconds + 5)
+                                                        continue
+                                                    except Exception as e:
+                                                        logger.error(f"❌ فشل الرد: {str(e)}")
+                                                        continue
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ فشل في المجموعة {dialog.name}: {str(e)}")
+                                    continue
                         
                     except Exception as e:
-                        logger.error(f"خطأ في الحساب {name}: {str(e)}")
+                        logger.error(f"❌ خطأ في الحساب {name}: {str(e)}")
+                        await self.cleanup_client(session_string)
                         continue
                 
+                # الانتظار 10 ثواني قبل الدورة التالية
                 await asyncio.sleep(10)
                 
             except Exception as e:
-                logger.error(f"خطأ في معالجة الردود الجماعية: {str(e)}")
+                logger.error(f"❌ خطأ في معالجة الردود الجماعية: {str(e)}")
                 await asyncio.sleep(30)
     
-    def start_group_reply(self, admin_id=None):
-        """بدء الردود في المجموعات"""
-        with self.lock:
-            if not self.group_reply_active:
-                self.group_reply_active = True
-                self.group_reply_thread = Thread(target=lambda: asyncio.run(self.handle_group_replies(admin_id)))
-                self.group_reply_thread.start()
-                return True
-        return False
-    
-    def stop_group_reply(self):
-        """إيقاف الردود في المجموعات"""
-        with self.lock:
-            if self.group_reply_active:
-                self.group_reply_active = False
-                if self.group_reply_thread:
-                    try:
-                        self.group_reply_thread.join(timeout=5)
-                    except:
-                        pass
-                return True
-        return False
-    
-    async def handle_random_replies(self, admin_id=None):
-        """معالجة الردود العشوائية في القروبات"""
-        while self.random_reply_active:
+    async def handle_random_replies_task(self, admin_id):
+        """مهمة الردود العشوائية في القروبات"""
+        while self.random_reply_active.get(admin_id, False):
             try:
                 accounts = self.db.get_active_publishing_accounts(admin_id)
                 random_replies = self.db.get_group_random_replies(admin_id)
                 
                 if not accounts or not random_replies:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)
                     continue
                 
                 for account in accounts:
-                    if not self.random_reply_active:
+                    if not self.random_reply_active.get(admin_id, False):
                         break
-                        
+                    
                     account_id, session_string, name, username = account
                     
                     try:
-                        client = TelegramClient(StringSession(session_string), 1, "b")
-                        await client.connect()
+                        client = await self.get_client(session_string)
+                        if not client:
+                            continue
                         
-                        if await client.is_user_authorized():
-                            dialogs = await client.get_dialogs()
+                        dialogs = await client.get_dialogs(limit=50)
+                        
+                        for dialog in dialogs:
+                            if not self.random_reply_active.get(admin_id, False):
+                                break
                             
-                            for dialog in dialogs:
-                                if not self.random_reply_active:
-                                    break
-                                    
-                                if dialog.is_group:
-                                    try:
-                                        async for message in client.iter_messages(dialog.id, limit=3):
-                                            if not self.random_reply_active:
-                                                break
-                                                
-                                            if message.text and not message.out:
-                                                random_reply = random.choice(random_replies)
-                                                reply_id, reply_text, is_active, added_date, reply_admin_id = random_reply
-                                                
-                                                if is_active:
-                                                    await client.send_message(dialog.id, reply_text, reply_to=message.id)
-                                                    logger.info(f"تم الرد العشوائي على عضو في {dialog.name} بواسطة {name}")
-                                                    await asyncio.sleep(1)
-                                                    break
+                            if dialog.is_group:
+                                try:
+                                    async for message in client.iter_messages(dialog.id, limit=3):
+                                        if not self.random_reply_active.get(admin_id, False):
+                                            break
                                         
-                                    except Exception as e:
-                                        logger.error(f"فشل الرد العشوائي في {dialog.name}: {str(e)}")
-                                        continue
-                        
-                        await client.disconnect()
+                                        if message.text and not message.out and random.random() < 1.0:  # 100% رد
+                                            random_reply = random.choice(random_replies)
+                                            reply_id, reply_text, media_path, is_active, added_date, reply_admin_id, is_encoded, has_media = random_reply
+                                            
+                                            if is_active:
+                                                try:
+                                                    if has_media and media_path and os.path.exists(media_path):
+                                                        await client.send_file(dialog.id, media_path, caption=reply_text, reply_to=message.id)
+                                                        logger.info(f"🎲 رد عشوائي مع صورة في {dialog.name} بواسطة {name}")
+                                                    else:
+                                                        await client.send_message(dialog.id, reply_text, reply_to=message.id)
+                                                        logger.info(f"🎲 رد عشوائي في {dialog.name} بواسطة {name}")
+                                                    
+                                                    await asyncio.sleep(0.5)
+                                                    break
+                                                    
+                                                except errors.FloodWaitError as e:
+                                                    logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
+                                                    await asyncio.sleep(e.seconds + 5)
+                                                    continue
+                                                except Exception as e:
+                                                    logger.error(f"❌ فشل الرد العشوائي: {str(e)}")
+                                                    continue
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ فشل في المجموعة {dialog.name}: {str(e)}")
+                                    continue
                         
                     except Exception as e:
-                        logger.error(f"خطأ في الحساب {name}: {str(e)}")
+                        logger.error(f"❌ خطأ في الحساب {name}: {str(e)}")
+                        await self.cleanup_client(session_string)
                         continue
                 
+                # الانتظار 10 ثواني قبل الدورة التالية
                 await asyncio.sleep(10)
                 
             except Exception as e:
-                logger.error(f"خطأ في معالجة الردود العشوائية: {str(e)}")
+                logger.error(f"❌ خطأ في معالجة الردود العشوائية: {str(e)}")
                 await asyncio.sleep(30)
     
-    def start_random_reply(self, admin_id=None):
-        """بدء الردود العشوائية في القروبات"""
+    def start_publishing(self, admin_id):
+        """بدء النشر التلقائي"""
         with self.lock:
-            if not self.random_reply_active:
-                self.random_reply_active = True
-                self.random_reply_thread = Thread(target=lambda: asyncio.run(self.handle_random_replies(admin_id)))
-                self.random_reply_thread.start()
+            if not self.publishing_active.get(admin_id, False):
+                self.publishing_active[admin_id] = True
+                task = asyncio.create_task(self.publish_to_groups_task(admin_id))
+                self.publishing_tasks[admin_id] = task
                 return True
         return False
     
-    def stop_random_reply(self):
-        """إيقاف الردود العشوائية في القروبات"""
+    def stop_publishing(self, admin_id):
+        """إيقاف النشر التلقائي"""
         with self.lock:
-            if self.random_reply_active:
-                self.random_reply_active = False
-                if self.random_reply_thread:
+            if self.publishing_active.get(admin_id, False):
+                self.publishing_active[admin_id] = False
+                if admin_id in self.publishing_tasks:
                     try:
-                        self.random_reply_thread.join(timeout=5)
+                        self.publishing_tasks[admin_id].cancel()
                     except:
                         pass
+                    del self.publishing_tasks[admin_id]
                 return True
         return False
+    
+    def start_private_reply(self, admin_id):
+        """بدء الرد على الرسائل الخاصة"""
+        with self.lock:
+            if not self.private_reply_active.get(admin_id, False):
+                self.private_reply_active[admin_id] = True
+                task = asyncio.create_task(self.handle_private_messages_task(admin_id))
+                self.private_reply_tasks[admin_id] = task
+                return True
+        return False
+    
+    def stop_private_reply(self, admin_id):
+        """إيقاف الرد على الرسائل الخاصة"""
+        with self.lock:
+            if self.private_reply_active.get(admin_id, False):
+                self.private_reply_active[admin_id] = False
+                if admin_id in self.private_reply_tasks:
+                    try:
+                        self.private_reply_tasks[admin_id].cancel()
+                    except:
+                        pass
+                    del self.private_reply_tasks[admin_id]
+                return True
+        return False
+    
+    def start_group_reply(self, admin_id):
+        """بدء الردود في المجموعات"""
+        with self.lock:
+            if not self.group_reply_active.get(admin_id, False):
+                self.group_reply_active[admin_id] = True
+                task = asyncio.create_task(self.handle_group_replies_task(admin_id))
+                self.group_reply_tasks[admin_id] = task
+                return True
+        return False
+    
+    def stop_group_reply(self, admin_id):
+        """إيقاف الردود في المجموعات"""
+        with self.lock:
+            if self.group_reply_active.get(admin_id, False):
+                self.group_reply_active[admin_id] = False
+                if admin_id in self.group_reply_tasks:
+                    try:
+                        self.group_reply_tasks[admin_id].cancel()
+                    except:
+                        pass
+                    del self.group_reply_tasks[admin_id]
+                return True
+        return False
+    
+    def start_random_reply(self, admin_id):
+        """بدء الردود العشوائية في القروبات"""
+        with self.lock:
+            if not self.random_reply_active.get(admin_id, False):
+                self.random_reply_active[admin_id] = True
+                task = asyncio.create_task(self.handle_random_replies_task(admin_id))
+                self.random_reply_tasks[admin_id] = task
+                return True
+        return False
+    
+    def stop_random_reply(self, admin_id):
+        """إيقاف الردود العشوائية في القروبات"""
+        with self.lock:
+            if self.random_reply_active.get(admin_id, False):
+                self.random_reply_active[admin_id] = False
+                if admin_id in self.random_reply_tasks:
+                    try:
+                        self.random_reply_tasks[admin_id].cancel()
+                    except:
+                        pass
+                    del self.random_reply_tasks[admin_id]
+                return True
+        return False
+    
+    def start_join_groups(self, admin_id):
+        """بدء الانضمام إلى المجموعات"""
+        with self.lock:
+            if not self.join_groups_active.get(admin_id, False):
+                self.join_groups_active[admin_id] = True
+                task = asyncio.create_task(self.join_groups_task(admin_id))
+                self.join_groups_tasks[admin_id] = task
+                return True
+        return False
+    
+    def stop_join_groups(self, admin_id):
+        """إيقاف الانضمام إلى المجموعات"""
+        with self.lock:
+            if self.join_groups_active.get(admin_id, False):
+                self.join_groups_active[admin_id] = False
+                if admin_id in self.join_groups_tasks:
+                    try:
+                        self.join_groups_tasks[admin_id].cancel()
+                    except:
+                        pass
+                    del self.join_groups_tasks[admin_id]
+                return True
+        return False
+    
+    async def cleanup_all(self):
+        """تنظيف جميع الموارد"""
+        for session_string in list(self.client_cache.keys()):
+            await self.cleanup_client(session_string)
 
 class BotHandler:
     def __init__(self):
@@ -983,21 +1427,24 @@ class BotHandler:
         user_context = self.get_user_context(user_id)
         user_context['conversation_active'] = False
         
-        # ترتيب جديد للوحة التحكم
         keyboard = [
             [InlineKeyboardButton("👥 إدارة الحسابات", callback_data="manage_accounts")],
             [InlineKeyboardButton("📢 إدارة الإعلانات", callback_data="manage_ads")],
             [InlineKeyboardButton("👥 إدارة المجموعات", callback_data="manage_groups")],
             [InlineKeyboardButton("💬 إدارة الردود", callback_data="manage_replies")],
             [InlineKeyboardButton("👨‍💼 إدارة المشرفين", callback_data="manage_admins")],
-            [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")]
+            [InlineKeyboardButton("🚀 بدء النشر", callback_data="start_publishing")],
+            [InlineKeyboardButton("⏹️ إيقاف النشر", callback_data="stop_publishing")]
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "🎮 **لوحة تحكم البوت المتكامل**\n\n"
-            "اختر القسم الذي تريد إدارته:",
+            "🚀 **لوحة تحكم البوت الفعلي**\n\n"
+            "✅ النشر يعمل فعلياً الآن\n"
+            "✅ الردود التلقائية تعمل\n"
+            "✅ الانضمام للمجموعات تلقائياً\n\n"
+            "اختر الإجراء الذي تريد تنفيذه:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
@@ -1040,8 +1487,24 @@ class BotHandler:
             await self.manage_replies(query, context)
         elif data == "manage_admins":
             await self.manage_admins(query, context)
-        elif data == "settings":
-            await self.settings_menu(query, context)
+        elif data == "start_publishing":
+            await self.start_publishing(query, context)
+        elif data == "stop_publishing":
+            await self.stop_publishing(query, context)
+        elif data == "start_private_reply":
+            await self.start_private_reply(query, context)
+        elif data == "stop_private_reply":
+            await self.stop_private_reply(query, context)
+        elif data == "start_group_reply":
+            await self.start_group_reply(query, context)
+        elif data == "stop_group_reply":
+            await self.stop_group_reply(query, context)
+        elif data == "start_random_reply":
+            await self.start_random_reply(query, context)
+        elif data == "stop_random_reply":
+            await self.stop_random_reply(query, context)
+        elif data == "start_join_groups":
+            await self.start_join_groups(query, context)
         
         # إدارة الحسابات
         elif data == "add_account":
@@ -1068,11 +1531,9 @@ class BotHandler:
             user_context['ad_type'] = ad_type
             
             if ad_type == 'contact':
-                # لجهة الاتصال، نطلب الملف مباشرة بدون نص
                 await query.edit_message_text(
                     f"📞 **إضافة جهة اتصال**\n\n"
-                    f"يرجى إرسال ملف جهة الاتصال (VCF):\n\n"
-                    f"يمكنك إرسال جهة اتصال من زر 'جهة اتصال' في التليجرام\n\n"
+                    f"أرسل ملف VCF أو جهة اتصال:\n\n"
                     f"أو أرسل /cancel للإلغاء",
                     parse_mode='Markdown'
                 )
@@ -1081,7 +1542,6 @@ class BotHandler:
                 context.user_data['conversation_active'] = True
                 return ADD_AD_MEDIA
             else:
-                # لأنواع الإعلانات الأخرى، نطلب النص أولاً
                 file_type_text = {
                     'text': 'نص الإعلان',
                     'photo': 'نص الإعلان للصورة',
@@ -1089,7 +1549,7 @@ class BotHandler:
                 
                 await query.edit_message_text(
                     f"📝 **{file_type_text.get(ad_type, 'إضافة نص الإعلان')}**\n\n"
-                    f"يرجى إرسال نص الإعلان:\n\n"
+                    f"أرسل النص الآن:\n\n"
                     f"أو أرسل /cancel للإلغاء",
                     parse_mode='Markdown'
                 )
@@ -1103,10 +1563,6 @@ class BotHandler:
             await self.add_group_start(update, context)
         elif data == "show_groups":
             await self.show_groups(query, context)
-        elif data == "start_publishing":
-            await self.start_publishing(query, context)
-        elif data == "stop_publishing":
-            await self.stop_publishing(query, context)
         
         # إدارة الردود
         elif data == "private_replies":
@@ -1121,18 +1577,22 @@ class BotHandler:
             await self.add_group_photo_reply_start(update, context)
         elif data == "add_random_reply":
             await self.add_random_reply_start(update, context)
-        elif data == "start_private_reply":
-            await self.start_private_reply(query, context)
-        elif data == "stop_private_reply":
-            await self.stop_private_reply(query, context)
-        elif data == "start_group_reply":
-            await self.start_group_reply(query, context)
-        elif data == "stop_group_reply":
-            await self.stop_group_reply(query, context)
-        elif data == "start_random_reply":
-            await self.start_random_reply(query, context)
-        elif data == "stop_random_reply":
-            await self.stop_random_reply(query, context)
+        elif data == "show_replies":
+            await self.show_replies_menu(query, context)
+        
+        # حذف الردود
+        elif data.startswith("delete_private_reply_"):
+            reply_id = int(data.split("_")[3])
+            await self.delete_private_reply(query, context, reply_id)
+        elif data.startswith("delete_text_reply_"):
+            reply_id = int(data.split("_")[3])
+            await self.delete_text_reply(query, context, reply_id)
+        elif data.startswith("delete_photo_reply_"):
+            reply_id = int(data.split("_")[3])
+            await self.delete_photo_reply(query, context, reply_id)
+        elif data.startswith("delete_random_reply_"):
+            reply_id = int(data.split("_")[3])
+            await self.delete_random_reply(query, context, reply_id)
         
         # إدارة المشرفين
         elif data == "add_admin":
@@ -1156,6 +1616,10 @@ class BotHandler:
             await self.manage_replies(query, context)
         elif data == "back_to_admins":
             await self.manage_admins(query, context)
+        elif data == "back_to_private_replies":
+            await self.manage_private_replies(query, context)
+        elif data == "back_to_group_replies":
+            await self.manage_group_replies(query, context)
     
     async def start_from_query(self, query, context):
         """بدء البوت من استعلام"""
@@ -1169,17 +1633,266 @@ class BotHandler:
             [InlineKeyboardButton("👥 إدارة المجموعات", callback_data="manage_groups")],
             [InlineKeyboardButton("💬 إدارة الردود", callback_data="manage_replies")],
             [InlineKeyboardButton("👨‍💼 إدارة المشرفين", callback_data="manage_admins")],
-            [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")]
+            [InlineKeyboardButton("🚀 بدء النشر", callback_data="start_publishing")],
+            [InlineKeyboardButton("⏹️ إيقاف النشر", callback_data="stop_publishing")]
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "🎮 **لوحة تحكم البوت المتكامل**\n\n"
-            "اختر القسم الذي تريد إدارته:",
+            "🚀 **لوحة تحكم البوت الفعلي**\n\n"
+            "✅ النشر يعمل فعلياً الآن\n"
+            "✅ الردود التلقائية تعمل\n"
+            "✅ الانضمام للمجموعات تلقائياً\n\n"
+            "اختر الإجراء الذي تريد تنفيذه:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
+    
+    async def start_publishing(self, query, context):
+        """بدء النشر التلقائي"""
+        admin_id = query.from_user.id
+        
+        # التحقق من وجود حسابات
+        accounts = self.db.get_active_publishing_accounts(admin_id)
+        if not accounts:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "❌ **لا توجد حسابات نشطة!**\n\n"
+                "يجب إضافة حسابات أولاً قبل بدء النشر.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return
+        
+        # التحقق من وجود إعلانات
+        ads = self.db.get_ads(admin_id)
+        if not ads:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "❌ **لا توجد إعلانات!**\n\n"
+                "يجب إضافة إعلانات أولاً قبل بدء النشر.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return
+        
+        if self.manager.start_publishing(admin_id):
+            keyboard = [
+                [InlineKeyboardButton("⏹️ إيقاف النشر", callback_data="stop_publishing")],
+                [InlineKeyboardButton("💬 بدء الرد في الخاص", callback_data="start_private_reply")],
+                [InlineKeyboardButton("👥 بدء الرد في القروبات", callback_data="start_group_reply")],
+                [InlineKeyboardButton("🎲 بدء الرد العشوائي", callback_data="start_random_reply")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                "🚀 **تم بدء النشر الفعلي!**\n\n"
+                f"✅ عدد الحسابات: {len(accounts)}\n"
+                f"✅ عدد الإعلانات: {len(ads)}\n"
+                f"⏰ السرعة: ثانية واحدة بين المجموعات\n\n"
+                "سيبدأ البوت بالنشر في جميع المجموعات الآن.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            
+            # تسجيل بدء النشر
+            logger.info(f"✅ بدأ النشر للمشرف {admin_id} بـ {len(accounts)} حساب و {len(ads)} إعلان")
+        else:
+            await query.edit_message_text("⚠️ النشر يعمل بالفعل!")
+    
+    async def stop_publishing(self, query, context):
+        """إيقاف النشر التلقائي"""
+        admin_id = query.from_user.id
+        if self.manager.stop_publishing(admin_id):
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("⏹️ **تم إيقاف النشر!**", reply_markup=reply_markup)
+            logger.info(f"⏹️ توقف النشر للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ النشر غير نشط!")
+    
+    async def start_private_reply(self, query, context):
+        """بدء الرد التلقائي في الخاص"""
+        admin_id = query.from_user.id
+        
+        # التحقق من وجود حسابات
+        accounts = self.db.get_active_publishing_accounts(admin_id)
+        if not accounts:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_private_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "❌ **لا توجد حسابات نشطة!**",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return
+        
+        # التحقق من وجود ردود
+        replies = self.db.get_private_replies(admin_id)
+        if not replies:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_private_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "❌ **لا توجد ردود خاصة!**",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return
+        
+        if self.manager.start_private_reply(admin_id):
+            keyboard = [[InlineKeyboardButton("⏹️ إيقاف الرد", callback_data="stop_private_reply")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "💬 **تم بدء الرد في الخاص!**\n\n"
+                f"✅ عدد الحسابات: {len(accounts)}\n"
+                f"✅ عدد الردود: {len(replies)}\n"
+                "سيبدأ البوت بالرد على الرسائل الخاصة الآن.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            logger.info(f"💬 بدأ الرد في الخاص للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ الرد في الخاص يعمل بالفعل!")
+    
+    async def stop_private_reply(self, query, context):
+        """إيقاف الرد التلقائي في الخاص"""
+        admin_id = query.from_user.id
+        if self.manager.stop_private_reply(admin_id):
+            await query.edit_message_text("⏹️ تم إيقاف الرد في الخاص!")
+            logger.info(f"⏹️ توقف الرد في الخاص للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ الرد في الخاص غير نشط!")
+    
+    async def start_group_reply(self, query, context):
+        """بدء الرد التلقائي في القروبات"""
+        admin_id = query.from_user.id
+        
+        accounts = self.db.get_active_publishing_accounts(admin_id)
+        if not accounts:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_group_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد حسابات نشطة!", reply_markup=reply_markup)
+            return
+        
+        text_replies = self.db.get_group_text_replies(admin_id)
+        photo_replies = self.db.get_group_photo_replies(admin_id)
+        
+        if not text_replies and not photo_replies:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_group_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد ردود مضافة!", reply_markup=reply_markup)
+            return
+        
+        if self.manager.start_group_reply(admin_id):
+            keyboard = [[InlineKeyboardButton("⏹️ إيقاف الرد", callback_data="stop_group_reply")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "👥 **تم بدء الرد في القروبات!**\n\n"
+                f"✅ عدد الحسابات: {len(accounts)}\n"
+                f"✅ عدد الردود النصية: {len(text_replies)}\n"
+                f"✅ عدد الردود مع الصور: {len(photo_replies)}\n"
+                "سيبدأ البوت بالرد على الرسائل في القروبات الآن.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            logger.info(f"👥 بدأ الرد في القروبات للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ الرد في القروبات يعمل بالفعل!")
+    
+    async def stop_group_reply(self, query, context):
+        """إيقاف الرد التلقائي في القروبات"""
+        admin_id = query.from_user.id
+        if self.manager.stop_group_reply(admin_id):
+            await query.edit_message_text("⏹️ تم إيقاف الرد في القروبات!")
+            logger.info(f"⏹️ توقف الرد في القروبات للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ الرد في القروبات غير نشط!")
+    
+    async def start_random_reply(self, query, context):
+        """بدء الردود العشوائية في القروبات"""
+        admin_id = query.from_user.id
+        
+        accounts = self.db.get_active_publishing_accounts(admin_id)
+        if not accounts:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_group_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد حسابات نشطة!", reply_markup=reply_markup)
+            return
+        
+        random_replies = self.db.get_group_random_replies(admin_id)
+        if not random_replies:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_group_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد ردود عشوائية مضافة!", reply_markup=reply_markup)
+            return
+        
+        if self.manager.start_random_reply(admin_id):
+            keyboard = [[InlineKeyboardButton("⏹️ إيقاف الرد العشوائي", callback_data="stop_random_reply")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "🎲 **تم بدء الردود العشوائية!**\n\n"
+                f"✅ عدد الحسابات: {len(accounts)}\n"
+                f"✅ عدد الردود العشوائية: {len(random_replies)}\n"
+                "✅ الرد على 100% من الرسائل\n"
+                "سيبدأ البوت بالرد العشوائي في القروبات الآن.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            logger.info(f"🎲 بدأ الرد العشوائي للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ الرد العشوائي يعمل بالفعل!")
+    
+    async def stop_random_reply(self, query, context):
+        """إيقاف الردود العشوائية في القروبات"""
+        admin_id = query.from_user.id
+        if self.manager.stop_random_reply(admin_id):
+            await query.edit_message_text("⏹️ تم إيقاف الرد العشوائي!")
+            logger.info(f"⏹️ توقف الرد العشوائي للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ الرد العشوائي غير نشط!")
+    
+    async def start_join_groups(self, query, context):
+        """بدء الانضمام إلى المجموعات"""
+        admin_id = query.from_user.id
+        
+        accounts = self.db.get_active_publishing_accounts(admin_id)
+        if not accounts:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_groups")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد حسابات نشطة!", reply_markup=reply_markup)
+            return
+        
+        groups = self.db.get_groups(admin_id)
+        bulk_groups = self.db.get_bulk_groups(admin_id)
+        
+        pending_groups = [g for g in groups if g[2] == 'pending']
+        pending_bulk_groups = [g for g in bulk_groups if g[4] == 'pending']
+        
+        if not pending_groups and not pending_bulk_groups:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_groups")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد مجموعات معلقة للانضمام!", reply_markup=reply_markup)
+            return
+        
+        if self.manager.start_join_groups(admin_id):
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_groups")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "👥 **بدأ الانضمام إلى المجموعات!**\n\n"
+                f"✅ عدد الحسابات: {len(accounts)}\n"
+                f"✅ عدد المجموعات المعلقة: {len(pending_groups) + len(pending_bulk_groups)}\n"
+                "⏰ الانتظار: دقيقة واحدة بين كل رابط\n\n"
+                "سيبدأ البوت بالانضمام إلى جميع المجموعات المعلقة الآن.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            logger.info(f"👥 بدأ الانضمام للمجموعات للمشرف {admin_id}")
+        else:
+            await query.edit_message_text("⚠️ عملية الانضمام تعمل بالفعل!")
     
     # قسم إدارة الحسابات
     async def manage_accounts(self, query, context):
@@ -1206,8 +1919,7 @@ class BotHandler:
         
         await update.callback_query.edit_message_text(
             "📱 **إضافة حساب جديد**\n\n"
-            "يرجى إرسال كود الجلسة (Session String):\n\n"
-            "يمكنك الحصول على كود الجلسة من @SessionStringBot\n\n"
+            "أرسل كود الجلسة (Session String):\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1228,25 +1940,43 @@ class BotHandler:
         
         await update.message.reply_text("⏳ جاري اختبار الجلسة...")
         
-        success, me = await self.manager.test_session(session_string)
-        
-        if success:
-            phone = me.phone if me.phone else "غير معروف"
-            name = f"{me.first_name} {me.last_name}" if me.last_name else me.first_name
-            username = f"@{me.username}" if me.username else "لا يوجد"
+        try:
+            client = TelegramClient(StringSession(session_string), 1, "b")
+            await client.connect()
             
-            result, message = self.db.add_account(session_string, phone, name, username, admin_id)
-            
-            if result:
-                await update.message.reply_text(f"✅ {message}\n\n📱 الحساب: {name}\n📞 الهاتف: {phone}\n👤 المستخدم: {username}")
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                await client.disconnect()
+                
+                phone = me.phone if me.phone else "غير معروف"
+                name = f"{me.first_name} {me.last_name}" if me.last_name else me.first_name
+                username = f"@{me.username}" if me.username else "لا يوجد"
+                
+                result, message = self.db.add_account(session_string, phone, name, username, admin_id)
+                
+                if result:
+                    keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_accounts")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await update.message.reply_text(
+                        f"✅ {message}\n\n"
+                        f"📱 الحساب: {name}\n"
+                        f"📞 الهاتف: {phone}\n"
+                        f"👤 المستخدم: {username}",
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await update.message.reply_text(f"❌ {message}")
             else:
-                await update.message.reply_text(f"❌ {message}")
-        else:
-            await update.message.reply_text("❌ كود الجلسة غير صالح أو الحساب غير مفعل")
+                await client.disconnect()
+                await update.message.reply_text("❌ كود الجلسة غير صالح أو الحساب غير مفعل")
+                
+        except Exception as e:
+            logger.error(f"خطأ في اختبار الجلسة: {str(e)}")
+            await update.message.reply_text(f"❌ خطأ في اختبار الجلسة: {str(e)}")
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
     
     async def show_accounts(self, query, context):
@@ -1255,7 +1985,9 @@ class BotHandler:
         accounts = self.db.get_accounts(admin_id)
         
         if not accounts:
-            await query.edit_message_text("❌ لا توجد حسابات مضافة")
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_accounts")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد حسابات مضافة", reply_markup=reply_markup)
             return
         
         text = "👥 **الحسابات المضافة:**\n\n"
@@ -1284,7 +2016,7 @@ class BotHandler:
         await query.edit_message_text(f"✅ تم حذف الحساب #{account_id}")
         await self.show_accounts(query, context)
     
-    # قسم إدارة الإعلانات - تم التصحيح
+    # قسم إدارة الإعلانات
     async def manage_ads(self, query, context):
         """إدارة الإعلانات"""
         keyboard = [
@@ -1323,7 +2055,6 @@ class BotHandler:
         user_id = update.message.from_user.id
         user_context = self.get_user_context(user_id)
         
-        # التحقق من حالة المحادثة
         if not user_context.get('conversation_active', False) and not context.user_data.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
@@ -1336,27 +2067,25 @@ class BotHandler:
         ad_text = update.message.text
         admin_id = update.message.from_user.id
         
-        # حفظ نص الإعلان
         user_context['ad_text'] = ad_text
         context.user_data['ad_text'] = ad_text
         
         if ad_type == 'text':
-            # إعلان نصي فقط
             success = self.db.add_ad('text', ad_text, admin_id=admin_id)
             if success:
-                await update.message.reply_text("✅ تم إضافة الإعلان النصي بنجاح")
+                keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_ads")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text("✅ تم إضافة الإعلان النصي بنجاح", reply_markup=reply_markup)
             else:
                 await update.message.reply_text("❌ فشل إضافة الإعلان النصي")
             
             user_context['conversation_active'] = False
             context.user_data['conversation_active'] = False
-            await self.start(update, context)
             return ConversationHandler.END
         elif ad_type == 'photo':
-            # صورة مع نص - نطلب الصورة
             await update.message.reply_text(
                 f"🖼️ **إضافة صورة**\n\n"
-                f"يرجى إرسال الصورة:\n\n"
+                f"أرسل الصورة الآن:\n\n"
                 f"أو أرسل /cancel للإلغاء"
             )
             return ADD_AD_MEDIA
@@ -1366,7 +2095,6 @@ class BotHandler:
         user_id = update.message.from_user.id
         user_context = self.get_user_context(user_id)
         
-        # التحقق من حالة المحادثة
         if not user_context.get('conversation_active', False) and not context.user_data.get('conversation_active', False):
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
@@ -1384,7 +2112,6 @@ class BotHandler:
         file_name = None
         mime_type = None
         
-        # التحقق من نوع الملف المرسل
         if update.message.photo:
             file_id = update.message.photo[-1].file_id
             file_type = 'photo'
@@ -1394,8 +2121,6 @@ class BotHandler:
             file_name = update.message.document.file_name
             mime_type = update.message.document.mime_type
         elif update.message.contact:
-            # جهة اتصال مباشرة (ليست ملف VCF)
-            # في هذه الحالة، سنقوم بإنشاء ملف VCF من بيانات جهة الاتصال
             contact = update.message.contact
             vcf_content = self.create_vcf_from_contact(contact)
             
@@ -1410,26 +2135,20 @@ class BotHandler:
                     
                     success = self.db.add_ad('contact', None, file_path, 'contact', admin_id)
                     if success:
-                        await update.message.reply_text("✅ تم إضافة جهة الاتصال بنجاح")
+                        keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_ads")]]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        await update.message.reply_text("✅ تم إضافة جهة الاتصال بنجاح", reply_markup=reply_markup)
                     else:
                         await update.message.reply_text("❌ فشل إضافة جهة الاتصال")
                     
                     user_context['conversation_active'] = False
                     context.user_data['conversation_active'] = False
-                    await self.start(update, context)
                     return ConversationHandler.END
                 except Exception as e:
                     logger.error(f"خطأ في حفظ جهة الاتصال: {str(e)}")
                     await update.message.reply_text("❌ حدث خطأ أثناء حفظ جهة الاتصال")
-                    user_context['conversation_active'] = False
-                    context.user_data['conversation_active'] = False
-                    await self.start(update, context)
                     return ConversationHandler.END
-            else:
-                await update.message.reply_text("❌ فشل إنشاء ملف VCF من جهة الاتصال")
-                return ADD_AD_MEDIA
         
-        # إذا لم يكن هناك ملف
         if not file_id and not update.message.contact:
             await update.message.reply_text("❌ يرجى إرسال صورة أو ملف VCF أو جهة اتصال")
             return ADD_AD_MEDIA
@@ -1444,32 +2163,17 @@ class BotHandler:
                 if file_type == 'photo':
                     file_path = f"ads/photo_{timestamp}.jpg"
                 elif file_type == 'document':
-                    # تحديد نوع الملف بناءً على الاسم والمحتوى
                     is_vcf = False
                     
-                    # التحقق من الامتداد
                     if file_name and file_name.lower().endswith(('.vcf', '.vcard')):
                         is_vcf = True
                     
-                    # التحقق من MIME type
                     if mime_type and 'vcard' in mime_type.lower():
                         is_vcf = True
                     
-                    # التحقق من المحتوى (قراءة أول 100 بايت)
-                    try:
-                        temp_path = f"temp_{timestamp}.bin"
-                        await file.download_to_drive(temp_path)
-                        with open(temp_path, 'rb') as f:
-                            content_start = f.read(100).decode('utf-8', errors='ignore')
-                            if 'BEGIN:VCARD' in content_start.upper():
-                                is_vcf = True
-                        os.remove(temp_path)
-                    except:
-                        pass
-                    
                     if is_vcf:
                         file_path = f"ads/contact_{timestamp}.vcf"
-                        ad_type = 'contact'  # تأكيد أنه ملف اتصال
+                        ad_type = 'contact'
                     else:
                         ext = file_name.split('.')[-1] if file_name else 'bin'
                         file_path = f"ads/document_{timestamp}.{ext}"
@@ -1479,11 +2183,9 @@ class BotHandler:
                 await file.download_to_drive(file_path)
                 
                 if ad_type == 'contact':
-                    # جهة اتصال - بدون نص
                     success = self.db.add_ad('contact', None, file_path, 'contact', admin_id)
                     message = "✅ تم إضافة جهة الاتصال بنجاح"
                 elif ad_type == 'photo':
-                    # صورة مع نص
                     success = self.db.add_ad('photo', ad_text, file_path, 'photo', admin_id)
                     message = "✅ تم إضافة الإعلان بالصورة بنجاح"
                 else:
@@ -1491,7 +2193,9 @@ class BotHandler:
                     message = "❌ نوع الإعلان غير معروف"
                 
                 if success:
-                    await update.message.reply_text(message)
+                    keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_ads")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(message, reply_markup=reply_markup)
                 else:
                     await update.message.reply_text("❌ فشل إضافة الإعلان، حاول مرة أخرى")
                     
@@ -1503,7 +2207,6 @@ class BotHandler:
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
     
     def create_vcf_from_contact(self, contact):
@@ -1513,7 +2216,6 @@ class BotHandler:
             vcf_lines.append("BEGIN:VCARD")
             vcf_lines.append("VERSION:3.0")
             
-            # الاسم
             full_name = ""
             if contact.first_name:
                 full_name += contact.first_name
@@ -1525,11 +2227,9 @@ class BotHandler:
                 if contact.first_name:
                     vcf_lines.append(f"N:{contact.last_name or ''};{contact.first_name};;;")
             
-            # رقم الهاتف
             if contact.phone_number:
                 vcf_lines.append(f"TEL;TYPE=CELL:{contact.phone_number}")
             
-            # معرف المستخدم (إذا كان متاحاً)
             if contact.user_id:
                 vcf_lines.append(f"X-TELEGRAM-ID:{contact.user_id}")
             
@@ -1546,14 +2246,16 @@ class BotHandler:
         ads = self.db.get_ads(admin_id)
         
         if not ads:
-            await query.edit_message_text("❌ لا توجد إعلانات مضافة")
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_ads")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد إعلانات مضافة", reply_markup=reply_markup)
             return
         
         text = "📢 **الإعلانات المضافة:**\n\n"
         keyboard = []
         
         for ad in ads:
-            ad_id, ad_type, ad_text, media_path, file_type, added_date, ad_admin_id = ad
+            ad_id, ad_type, ad_text, media_path, file_type, added_date, ad_admin_id, is_encoded = ad
             type_emoji = {"text": "📝", "photo": "🖼️", "contact": "📞"}
 
             text += f"**#{ad_id}** - {type_emoji.get(ad_type, '📄')} {ad_type}\n"
@@ -1581,14 +2283,13 @@ class BotHandler:
         await query.edit_message_text(f"✅ تم حذف الإعلان #{ad_id}")
         await self.show_ads(query, context)
     
-    # قسم إدارة المجموعات
+    # قسم إدارة المجموعات مع دعم المجموعات المجمعة
     async def manage_groups(self, query, context):
         """إدارة المجموعات"""
         keyboard = [
             [InlineKeyboardButton("➕ إضافة مجموعة", callback_data="add_group")],
             [InlineKeyboardButton("📊 عرض المجموعات", callback_data="show_groups")],
-            [InlineKeyboardButton("🚀 بدء النشر التلقائي", callback_data="start_publishing")],
-            [InlineKeyboardButton("⏹️ إيقاف النشر", callback_data="stop_publishing")],
+            [InlineKeyboardButton("👥 الانضمام للمجموعات", callback_data="start_join_groups")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1607,9 +2308,8 @@ class BotHandler:
         user_context['conversation_active'] = True
         
         await update.callback_query.edit_message_text(
-            "👥 **إضافة مجموعة جديدة**\n\n"
-            "يرجى إرسال رابط المجموعة:\n\n"
-            "يمكنك إرسال رابط واحد أو عدة روابط مفصولة بمسافات\n\n"
+            "👥 **إضافة مجموعات**\n\n"
+            "أرسل رابط مجموعة أو عدة روابط:\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1625,68 +2325,87 @@ class BotHandler:
             await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
             return ConversationHandler.END
             
-        group_links = update.message.text.split()
+        message_text = update.message.text
         admin_id = update.message.from_user.id
         
+        # البحث عن جميع الروابط في النص
+        url_pattern = r'(https?://[^\s]+|t\.me/[^\s]+)'
+        links = re.findall(url_pattern, message_text)
+        
         added_count = 0
-        for link in group_links:
-            if link.startswith('https://t.me/') or link.startswith('t.me/'):
+        for link in links:
+            if 't.me' in link:
                 self.db.add_group(link, admin_id)
                 added_count += 1
         
         if added_count > 0:
-            asyncio.create_task(self.manager.join_groups(admin_id))
-            await update.message.reply_text(f"✅ تم إضافة {added_count} مجموعة وبدأ عملية الانضمام")
+            keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_groups")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"✅ تم إضافة {added_count} مجموعة\n\n"
+                f"سيبدأ البوت بالانضمام إليها تلقائياً خلال دقيقة واحدة بين كل رابط.",
+                reply_markup=reply_markup
+            )
+            
+            # بدء عملية الانضمام بعد تأكيد الإضافة
+            asyncio.create_task(self.delayed_join_groups(admin_id))
         else:
             await update.message.reply_text("❌ لم يتم إضافة أي مجموعة، تأكد من صحة الروابط")
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
+    
+    async def delayed_join_groups(self, admin_id):
+        """بدء الانضمام للمجموعات بعد تأخير"""
+        await asyncio.sleep(2)  # انتظار قصير للتأكد من حفظ البيانات
+        self.manager.start_join_groups(admin_id)
     
     async def show_groups(self, query, context):
         """عرض المجموعات"""
         admin_id = query.from_user.id
         groups = self.db.get_groups(admin_id)
+        bulk_groups = self.db.get_bulk_groups(admin_id)
         
-        if not groups:
-            await query.edit_message_text("❌ لا توجد مجموعات مضافة")
+        if not groups and not bulk_groups:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_groups")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد مجموعات مضافة", reply_markup=reply_markup)
             return
         
         text = "👥 **المجموعات المضافة:**\n\n"
         
-        for group in groups:
-            group_id, link, status, join_date, added_date, group_admin_id = group
-            status_emoji = {"pending": "⏳", "joined": "✅", "failed": "❌"}
-            
-            text += f"**#{group_id}** - {link}\n"
-            text += f"الحالة: {status_emoji.get(status, '❓')} {status}\n"
-            
-            if join_date:
-                text += f"تاريخ الانضمام: {join_date}\n"
-            
-            text += "─" * 20 + "\n"
+        if bulk_groups:
+            text += "**المجموعات المجمعة:**\n"
+            for group in bulk_groups:
+                group_id, message_id, link, name, status, added_date, group_admin_id = group
+                status_emoji = {"pending": "⏳", "joined": "✅", "failed": "❌"}
+                
+                text += f"**#{group_id}** - {name}\n"
+                text += f"🔗 {link}\n"
+                text += f"الحالة: {status_emoji.get(status, '❓')} {status}\n"
+                text += "─" * 20 + "\n"
+        
+        if groups:
+            if bulk_groups:
+                text += "\n**المجموعات الفردية:**\n"
+            for group in groups:
+                group_id, link, status, join_date, added_date, group_admin_id = group
+                status_emoji = {"pending": "⏳", "joined": "✅", "failed": "❌"}
+                
+                text += f"**#{group_id}** - {link}\n"
+                text += f"الحالة: {status_emoji.get(status, '❓')} {status}\n"
+                
+                if join_date:
+                    text += f"تاريخ الانضمام: {join_date}\n"
+                
+                text += "─" * 20 + "\n"
         
         keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_groups")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    async def start_publishing(self, query, context):
-        """بدء النشر التلقائي"""
-        admin_id = query.from_user.id
-        if self.manager.start_publishing(admin_id):
-            await query.edit_message_text("🚀 تم بدء النشر التلقائي في جميع الحسابات والمجموعات")
-        else:
-            await query.edit_message_text("⚠️ النشر التلقائي يعمل بالفعل")
-    
-    async def stop_publishing(self, query, context):
-        """إيقاف النشر التلقائي"""
-        if self.manager.stop_publishing():
-            await query.edit_message_text("⏹️ تم إيقاف النشر التلقائي")
-        else:
-            await query.edit_message_text("⚠️ النشر التلقائي غير نشط")
     
     # قسم إدارة الردود
     async def manage_replies(self, query, context):
@@ -1694,6 +2413,7 @@ class BotHandler:
         keyboard = [
             [InlineKeyboardButton("💬 الردود في الخاص", callback_data="private_replies")],
             [InlineKeyboardButton("👥 الردود في القروبات", callback_data="group_replies")],
+            [InlineKeyboardButton("🗑️ عرض الردود للحذف", callback_data="show_replies")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1705,6 +2425,170 @@ class BotHandler:
             parse_mode='Markdown'
         )
     
+    async def show_replies_menu(self, query, context):
+        """عرض قائمة حذف الردود"""
+        keyboard = [
+            [InlineKeyboardButton("🗑️ حذف ردود الخاصة", callback_data="show_private_replies_delete")],
+            [InlineKeyboardButton("🗑️ حذف ردود القروبات النصية", callback_data="show_text_replies_delete")],
+            [InlineKeyboardButton("🗑️ حذف ردود القروبات مع صور", callback_data="show_photo_replies_delete")],
+            [InlineKeyboardButton("🗑️ حذف ردود عشوائية", callback_data="show_random_replies_delete")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_replies")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "🗑️ **حذف الردود**\n\n"
+            "اختر نوع الردود التي تريد حذفها:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    
+    async def show_private_replies_delete(self, query, context):
+        """عرض الردود الخاصة للحذف"""
+        admin_id = query.from_user.id
+        replies = self.db.get_private_replies(admin_id)
+        
+        if not replies:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد ردود خاصة مضافة", reply_markup=reply_markup)
+            return
+        
+        text = "🗑️ **الردود في الخاص للحذف:**\n\n"
+        keyboard = []
+        
+        for reply in replies:
+            reply_id, reply_text, is_active, added_date, reply_admin_id, is_encoded = reply
+            
+            text += f"**#{reply_id}**\n"
+            text += f"📝 {reply_text[:50]}...\n"
+            text += f"الحالة: {'🟢 نشط' if is_active else '🔴 غير نشط'}\n"
+            text += "─" * 20 + "\n"
+            
+            keyboard.append([InlineKeyboardButton(f"🗑️ حذف #{reply_id}", callback_data=f"delete_private_reply_{reply_id}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    async def delete_private_reply(self, query, context, reply_id):
+        """حذف رد خاص"""
+        admin_id = query.from_user.id
+        self.db.delete_private_reply(reply_id, admin_id)
+        await query.edit_message_text(f"✅ تم حذف الرد الخاص #{reply_id}")
+        await self.show_private_replies_delete(query, context)
+    
+    async def show_text_replies_delete(self, query, context):
+        """عرض الردود النصية للحذف"""
+        admin_id = query.from_user.id
+        replies = self.db.get_group_text_replies(admin_id)
+        
+        if not replies:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد ردود نصية مضافة", reply_markup=reply_markup)
+            return
+        
+        text = "🗑️ **الردود النصية في القروبات للحذف:**\n\n"
+        keyboard = []
+        
+        for reply in replies:
+            reply_id, trigger, reply_text, is_active, added_date, reply_admin_id, is_encoded = reply
+            
+            text += f"**#{reply_id}** - {trigger}\n"
+            text += f"➡️ {reply_text[:30]}...\n"
+            text += f"الحالة: {'🟢 نشط' if is_active else '🔴 غير نشط'}\n"
+            text += "─" * 20 + "\n"
+            
+            keyboard.append([InlineKeyboardButton(f"🗑️ حذف #{reply_id}", callback_data=f"delete_text_reply_{reply_id}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    async def delete_text_reply(self, query, context, reply_id):
+        """حذف رد نصي"""
+        admin_id = query.from_user.id
+        self.db.delete_group_text_reply(reply_id, admin_id)
+        await query.edit_message_text(f"✅ تم حذف الرد النصي #{reply_id}")
+        await self.show_text_replies_delete(query, context)
+    
+    async def show_photo_replies_delete(self, query, context):
+        """عرض الردود مع الصور للحذف"""
+        admin_id = query.from_user.id
+        replies = self.db.get_group_photo_replies(admin_id)
+        
+        if not replies:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد ردود مع صور مضافة", reply_markup=reply_markup)
+            return
+        
+        text = "🗑️ **الردود مع الصور في القروبات للحذف:**\n\n"
+        keyboard = []
+        
+        for reply in replies:
+            reply_id, trigger, reply_text, media_path, is_active, added_date, reply_admin_id, is_encoded = reply
+            
+            text += f"**#{reply_id}** - {trigger}\n"
+            text += f"➡️ {reply_text[:30] if reply_text else 'بدون نص'}...\n"
+            text += f"🖼️ مع صورة\n"
+            text += f"الحالة: {'🟢 نشط' if is_active else '🔴 غير نشط'}\n"
+            text += "─" * 20 + "\n"
+            
+            keyboard.append([InlineKeyboardButton(f"🗑️ حذف #{reply_id}", callback_data=f"delete_photo_reply_{reply_id}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    async def delete_photo_reply(self, query, context, reply_id):
+        """حذف رد مع صورة"""
+        admin_id = query.from_user.id
+        self.db.delete_group_photo_reply(reply_id, admin_id)
+        await query.edit_message_text(f"✅ تم حذف الرد مع الصورة #{reply_id}")
+        await self.show_photo_replies_delete(query, context)
+    
+    async def show_random_replies_delete(self, query, context):
+        """عرض الردود العشوائية للحذف"""
+        admin_id = query.from_user.id
+        replies = self.db.get_group_random_replies(admin_id)
+        
+        if not replies:
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد ردود عشوائية مضافة", reply_markup=reply_markup)
+            return
+        
+        text = "🗑️ **الردود العشوائية في القروبات للحذف:**\n\n"
+        keyboard = []
+        
+        for reply in replies:
+            reply_id, reply_text, media_path, is_active, added_date, reply_admin_id, is_encoded, has_media = reply
+            
+            text += f"**#{reply_id}**\n"
+            text += f"🎲 {reply_text[:50] if reply_text else 'رد عشوائي'}...\n"
+            text += f"🖼️ {'مع صورة' if has_media else 'نص فقط'}\n"
+            text += f"الحالة: {'🟢 نشط' if is_active else '🔴 غير نشط'}\n"
+            text += "─" * 20 + "\n"
+            
+            keyboard.append([InlineKeyboardButton(f"🗑️ حذف #{reply_id}", callback_data=f"delete_random_reply_{reply_id}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="show_replies")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    async def delete_random_reply(self, query, context, reply_id):
+        """حذف رد عشوائي"""
+        admin_id = query.from_user.id
+        self.db.delete_group_random_reply(reply_id, admin_id)
+        await query.edit_message_text(f"✅ تم حذف الرد العشوائي #{reply_id}")
+        await self.show_random_replies_delete(query, context)
+    
     async def manage_private_replies(self, query, context):
         """إدارة الردود الخاصة"""
         admin_id = query.from_user.id
@@ -1715,7 +2599,7 @@ class BotHandler:
         
         if replies:
             for reply in replies:
-                reply_id, reply_text, is_active, added_date, reply_admin_id = reply
+                reply_id, reply_text, is_active, added_date, reply_admin_id, is_encoded = reply
                 status = "🟢 نشط" if is_active else "🔴 غير نشط"
                 
                 text += f"**#{reply_id}**\n"
@@ -1726,8 +2610,8 @@ class BotHandler:
             text += "❌ لا توجد ردود مضافة\n"
         
         keyboard.append([InlineKeyboardButton("➕ إضافة رد", callback_data="add_private_reply")])
-        keyboard.append([InlineKeyboardButton("🚀 بدء الرد التلقائي", callback_data="start_private_reply")])
-        keyboard.append([InlineKeyboardButton("⏹️ إيقاف الرد التلقائي", callback_data="stop_private_reply")])
+        keyboard.append([InlineKeyboardButton("🚀 بدء الرد في الخاص", callback_data="start_private_reply")])
+        keyboard.append([InlineKeyboardButton("⏹️ إيقاف الرد في الخاص", callback_data="stop_private_reply")])
         keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_to_replies")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1741,7 +2625,7 @@ class BotHandler:
         
         await update.callback_query.edit_message_text(
             "💬 **إضافة رد في الخاص**\n\n"
-            "يرجى إرسال نص الرد الذي سيتم إرساله للمستخدمين في الخاص:\n\n"
+            "أرسل نص الرد الآن:\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1761,26 +2645,15 @@ class BotHandler:
         admin_id = update.message.from_user.id
         
         self.db.add_private_reply(reply_text, admin_id=admin_id)
-        await update.message.reply_text("✅ تم إضافة الرد في الخاص بنجاح")
+        
+        keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_private_replies")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text("✅ تم إضافة الرد في الخاص بنجاح", reply_markup=reply_markup)
+        
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
-    
-    async def start_private_reply(self, query, context):
-        """بدء الرد التلقائي في الخاص"""
-        admin_id = query.from_user.id
-        if self.manager.start_private_reply(admin_id):
-            await query.edit_message_text("🚀 تم بدء الرد التلقائي على الرسائل الخاصة")
-        else:
-            await query.edit_message_text("⚠️ الرد التلقائي على الرسائل الخاصة يعمل بالفعل")
-    
-    async def stop_private_reply(self, query, context):
-        """إيقاف الرد التلقائي في الخاص"""
-        if self.manager.stop_private_reply():
-            await query.edit_message_text("⏹️ تم إيقاف الرد التلقائي على الرسائل الخاصة")
-        else:
-            await query.edit_message_text("⚠️ الرد التلقائي على الرسائل الخاصة غير نشط")
     
     async def manage_group_replies(self, query, context):
         """إدارة الردود في القروبات"""
@@ -1795,7 +2668,7 @@ class BotHandler:
         if text_replies or photo_replies:
             if text_replies:
                 for reply in text_replies:
-                    reply_id, trigger, reply_text, is_active, added_date, reply_admin_id = reply
+                    reply_id, trigger, reply_text, is_active, added_date, reply_admin_id, is_encoded = reply
                     status = "🟢 نشط" if is_active else "🔴 غير نشط"
                     
                     text += f"**#{reply_id}** - {trigger}\n"
@@ -1805,11 +2678,11 @@ class BotHandler:
             
             if photo_replies:
                 for reply in photo_replies:
-                    reply_id, trigger, reply_text, media_path, is_active, added_date, reply_admin_id = reply
+                    reply_id, trigger, reply_text, media_path, is_active, added_date, reply_admin_id, is_encoded = reply
                     status = "🟢 نشط" if is_active else "🔴 غير نشط"
                     
                     text += f"**#{reply_id}** - {trigger}\n"
-                    text += f"➡️ {reply_text[:30]}...\n"
+                    text += f"➡️ {reply_text[:30] if reply_text else 'بدون نص'}...\n"
                     text += f"الحالة: {status}\n"
                     text += "─" * 20 + "\n"
         else:
@@ -1818,10 +2691,11 @@ class BotHandler:
         text += "\n**الردود العشوائية (100%):**\n"
         if random_replies:
             for reply in random_replies:
-                reply_id, reply_text, is_active, added_date, reply_admin_id = reply
+                reply_id, reply_text, media_path, is_active, added_date, reply_admin_id, is_encoded, has_media = reply
                 status = "🟢 نشط" if is_active else "🔴 غير نشط"
                 
-                text += f"**#{reply_id}** - {reply_text[:50]}...\n"
+                text += f"**#{reply_id}** - {reply_text[:50] if reply_text else 'رد عشوائي'}...\n"
+                text += f"🖼️ {'مع صورة' if has_media else 'نص فقط'}\n"
                 text += f"الحالة: {status}\n"
                 text += "─" * 20 + "\n"
         else:
@@ -1849,7 +2723,7 @@ class BotHandler:
         
         await update.callback_query.edit_message_text(
             "👥 **إضافة رد نصي في القروبات**\n\n"
-            "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
+            "أرسل النص الذي سيتم الرد عليه:\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1870,7 +2744,7 @@ class BotHandler:
         
         await update.message.reply_text(
             "👥 **إضافة رد نصي في القروبات**\n\n"
-            "يرجى إرسال نص الرد:\n\n"
+            "أرسل نص الرد الآن:\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1891,13 +2765,16 @@ class BotHandler:
         
         if trigger:
             self.db.add_group_text_reply(trigger, reply_text, admin_id=admin_id)
-            await update.message.reply_text("✅ تم إضافة الرد النصي في القروبات بنجاح")
+            
+            keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_group_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text("✅ تم إضافة الرد النصي في القروبات بنجاح", reply_markup=reply_markup)
         else:
             await update.message.reply_text("❌ لم يتم تحديد النص المحفز")
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
     
     async def add_group_photo_reply_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1908,7 +2785,7 @@ class BotHandler:
         
         await update.callback_query.edit_message_text(
             "👥 **إضافة رد مع صورة في القروبات**\n\n"
-            "يرجى إرسال النص الذي سيتم الرد عليه:\n\n"
+            "أرسل النص الذي سيتم الرد عليه:\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1929,7 +2806,7 @@ class BotHandler:
         
         await update.message.reply_text(
             "👥 **إضافة رد مع صورة في القروبات**\n\n"
-            "يرجى إرسال نص الرد:\n\n"
+            "أرسل نص الرد الآن (يمكنك تركها فارغة):\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1949,7 +2826,7 @@ class BotHandler:
         
         await update.message.reply_text(
             "👥 **إضافة رد مع صورة في القروبات**\n\n"
-            "يرجى إرسال الصورة:\n\n"
+            "أرسل الصورة الآن:\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -1978,11 +2855,15 @@ class BotHandler:
                 file_path = f"group_replies/photo_{timestamp}.jpg"
                 await file.download_to_drive(file_path)
                 
-                if trigger and reply_text:
+                if trigger:
                     self.db.add_group_photo_reply(trigger, reply_text, file_path, admin_id=admin_id)
-                    await update.message.reply_text("✅ تم إضافة الرد مع الصورة في القروبات بنجاح")
+                    
+                    keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_group_replies")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await update.message.reply_text("✅ تم إضافة الرد مع الصورة في القروبات بنجاح", reply_markup=reply_markup)
                 else:
-                    await update.message.reply_text("❌ لم يتم تحديد النص المحفز أو نص الرد")
+                    await update.message.reply_text("❌ لم يتم تحديد النص المحفز")
             except Exception as e:
                 logger.error(f"خطأ في حفظ صورة الرد: {str(e)}")
                 await update.message.reply_text("❌ حدث خطأ أثناء حفظ الصورة")
@@ -1992,7 +2873,6 @@ class BotHandler:
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
     
     async def add_random_reply_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2003,7 +2883,7 @@ class BotHandler:
         
         await update.callback_query.edit_message_text(
             "🎲 **إضافة رد عشوائي في القروبات**\n\n"
-            "يرجى إرسال نص الرد العشوائي:\n\n"
+            "أرسل نص الرد العشوائي الآن:\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -2022,42 +2902,90 @@ class BotHandler:
         reply_text = update.message.text
         admin_id = update.message.from_user.id
         
-        self.db.add_group_random_reply(reply_text, admin_id=admin_id)
-        await update.message.reply_text("✅ تم إضافة الرد العشوائي بنجاح")
+        # حفظ النص أولاً
+        user_context['random_reply_text'] = reply_text
+        context.user_data['random_reply_text'] = reply_text
+        
+        await update.message.reply_text(
+            "🎲 **إضافة رد عشوائي في القروبات**\n\n"
+            "هل تريد إضافة صورة مع الرد؟\n"
+            "✅ أرسل صورة الآن\n"
+            "❌ أو أرسل /skip لتخطي إضافة صورة\n\n"
+            "أرسل /cancel للإلغاء",
+            parse_mode='Markdown'
+        )
+        
+        # سيتم التعامل مع الصورة في معالج منفصل
+        return ADD_RANDOM_REPLY
+    
+    async def add_random_reply_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """معالجة وسائط الرد العشوائي"""
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False) and not context.user_data.get('conversation_active', False):
+            await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
+            return ConversationHandler.END
+            
+        reply_text = user_context.get('random_reply_text') or context.user_data.get('random_reply_text')
+        admin_id = update.message.from_user.id
+        
+        media_path = None
+        
+        if update.message.photo:
+            try:
+                os.makedirs("random_replies", exist_ok=True)
+                
+                file_id = update.message.photo[-1].file_id
+                file = await context.bot.get_file(file_id)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                media_path = f"random_replies/photo_{timestamp}.jpg"
+                await file.download_to_drive(media_path)
+            except Exception as e:
+                logger.error(f"خطأ في حفظ صورة الرد العشوائي: {str(e)}")
+        
+        if reply_text:
+            self.db.add_group_random_reply(reply_text, media_path, admin_id=admin_id)
+            
+            keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_group_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            if media_path:
+                await update.message.reply_text("✅ تم إضافة الرد العشوائي مع الصورة بنجاح", reply_markup=reply_markup)
+            else:
+                await update.message.reply_text("✅ تم إضافة الرد العشوائي النصي بنجاح", reply_markup=reply_markup)
+        else:
+            await update.message.reply_text("❌ لم يتم تحديد نص الرد")
+        
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
     
-    async def start_group_reply(self, query, context):
-        """بدء الرد التلقائي في القروبات"""
-        admin_id = query.from_user.id
-        if self.manager.start_group_reply(admin_id):
-            await query.edit_message_text("🚀 تم بدء الرد التلقائي على الرسائل المحددة في القروبات")
+    async def skip_random_reply_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """تخطي إضافة وسائط للرد العشوائي"""
+        user_id = update.message.from_user.id
+        user_context = self.get_user_context(user_id)
+        
+        if not user_context.get('conversation_active', False) and not context.user_data.get('conversation_active', False):
+            await update.message.reply_text("❌ تم إلغاء العملية. استخدم /start للبدء من جديد.")
+            return ConversationHandler.END
+            
+        reply_text = user_context.get('random_reply_text') or context.user_data.get('random_reply_text')
+        admin_id = update.message.from_user.id
+        
+        if reply_text:
+            self.db.add_group_random_reply(reply_text, None, admin_id=admin_id)
+            
+            keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_group_replies")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text("✅ تم إضافة الرد العشوائي النصي بنجاح", reply_markup=reply_markup)
         else:
-            await query.edit_message_text("⚠️ الرد التلقائي على الرسائل المحددة في القروبات يعمل بالفعل")
-    
-    async def stop_group_reply(self, query, context):
-        """إيقاف الرد التلقائي في القروبات"""
-        if self.manager.stop_group_reply():
-            await query.edit_message_text("⏹️ تم إيقاف الرد التلقائي على الرسائل المحددة في القروبات")
-        else:
-            await query.edit_message_text("⚠️ الرد التلقائي على الرسائل المحددة في القروبات غير نشط")
-    
-    async def start_random_reply(self, query, context):
-        """بدء الردود العشوائية في القروبات"""
-        admin_id = query.from_user.id
-        if self.manager.start_random_reply(admin_id):
-            await query.edit_message_text("🚀 تم بدء الردود العشوائية في القروبات (الرد على 100% من الرسائل)")
-        else:
-            await query.edit_message_text("⚠️ الردود العشوائية في القروبات تعمل بالفعل")
-    
-    async def stop_random_reply(self, query, context):
-        """إيقاف الردود العشوائية في القروبات"""
-        if self.manager.stop_random_reply():
-            await query.edit_message_text("⏹️ تم إيقاف الردود العشوائية في القروبات")
-        else:
-            await query.edit_message_text("⚠️ الردود العشوائية في القروبات غير نشطة")
+            await update.message.reply_text("❌ لم يتم تحديد نص الرد")
+        
+        user_context['conversation_active'] = False
+        context.user_data['conversation_active'] = False
+        return ConversationHandler.END
     
     # قسم إدارة المشرفين
     async def manage_admins(self, query, context):
@@ -2084,8 +3012,7 @@ class BotHandler:
         
         await update.callback_query.edit_message_text(
             "👨‍💼 **إضافة مشرف جديد**\n\n"
-            "يرجى إرسال معرف المستخدم (User ID) للمشرف الجديد:\n\n"
-            "يمكنك الحصول على الـ User ID من @userinfobot\n\n"
+            "أرسل معرف المستخدم (User ID):\n\n"
             "أو أرسل /cancel للإلغاء",
             parse_mode='Markdown'
         )
@@ -2108,14 +3035,17 @@ class BotHandler:
             full_name = "مشرف جديد"
             
             result, message = self.db.add_admin(user_id_to_add, username, full_name, False)
-            await update.message.reply_text(f"✅ {message}\n\nتم إضافة المستخدم {user_id_to_add} كمشرف")
+            
+            keyboard = [[InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back_to_admins")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(f"✅ {message}\n\nتم إضافة المستخدم {user_id_to_add} كمشرف", reply_markup=reply_markup)
                 
         except ValueError:
             await update.message.reply_text("❌ معرف المستخدم يجب أن يكون رقماً")
         
         user_context['conversation_active'] = False
         context.user_data['conversation_active'] = False
-        await self.start(update, context)
         return ConversationHandler.END
     
     async def show_admins(self, query, context):
@@ -2123,7 +3053,9 @@ class BotHandler:
         admins = self.db.get_admins()
         
         if not admins:
-            await query.edit_message_text("❌ لا توجد مشرفين مضافة")
+            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_admins")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ لا توجد مشرفين مضافة", reply_markup=reply_markup)
             return
         
         text = "👨‍💼 **المشرفين المضافين:**\n\n"
@@ -2151,28 +3083,12 @@ class BotHandler:
         await query.edit_message_text(f"✅ تم حذف المشرف #{admin_id}")
         await self.show_admins(query, context)
     
-    # قسم الإعدادات
-    async def settings_menu(self, query, context):
-        """قائمة الإعدادات"""
-        keyboard = [
-            [InlineKeyboardButton("📊 حالة البوت", callback_data="bot_status")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "⚙️ **إعدادات البوت**\n\n"
-            "اختر الإعداد الذي تريد تعديله:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-    
     def setup_handlers(self):
         """إعداد معالجات البوت"""
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("cancel", self.cancel))
         
-        # معالجات المحادثة - تم إصلاحها
+        # معالجات المحادثة
         add_account_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.add_account_start, pattern="^add_account$")],
             states={
@@ -2182,7 +3098,6 @@ class BotHandler:
         )
         self.application.add_handler(add_account_conv)
         
-        # معالج الإعلانات - تم إصلاحه تماماً ليدعم جميع أنواع جهات الاتصال
         add_ad_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.handle_callback, pattern="^ad_type_")],
             states={
@@ -2227,7 +3142,10 @@ class BotHandler:
         group_text_reply_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.add_group_text_reply_start, pattern="^add_group_text_reply$")],
             states={
-                ADD_GROUP_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_group_text_reply_trigger)]
+                ADD_GROUP_TEXT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_group_text_reply_trigger),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_group_text_reply_text)
+                ]
             },
             fallbacks=[CommandHandler("cancel", self.cancel)]
         )
@@ -2249,7 +3167,11 @@ class BotHandler:
         random_reply_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.add_random_reply_start, pattern="^add_random_reply$")],
             states={
-                ADD_RANDOM_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_random_reply_text)]
+                ADD_RANDOM_REPLY: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.add_random_reply_text),
+                    MessageHandler(filters.PHOTO, self.add_random_reply_media),
+                    CommandHandler("skip", self.skip_random_reply_media)
+                ]
             },
             fallbacks=[CommandHandler("cancel", self.cancel)]
         )
@@ -2262,29 +3184,27 @@ class BotHandler:
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.setup_handlers()
         
-        # إضافة مشرف رئيسي - غير هذا الرقم إلى ID الخاص بك!
+        # إضافة مشرف رئيسي
         try:
             self.db.add_admin(8294336757, "@user", "المشرف الرئيسي", True)
             print(f"✅ تم إضافة الآيدي 8294336757 كمشرف رئيسي")
         except:
-            print(f"⚠️  الآيدي 8390377822 مضاف مسبقاً كمشرف رئيسي")
+            print(f"⚠️  الآيدي 8294336757 مضاف مسبقاً كمشرف رئيسي")
         
-        print("🤖 البوت يعمل الآن...")
-        print("🎯 البوت جاهز بنسبة 100%")
-        print("✅ جميع المشاكل تم إصلاحها")
-        print("📢 إدارة الإعلانات تعمل بشكل كامل")
-        print("📞 جهات الاتصال تعمل الآن بشكل صحيح:")
-        print("   ✅ يدعم ملفات VCF")
-        print("   ✅ يدعم جهات الاتصال المباشرة")
-        print("   ✅ يدعم زر 'جهة اتصال' في التليجرام")
-        print("👥 إدارة الحسابات تعمل بشكل كامل")
-        print("💬 إدارة الردود تعمل بشكل كامل")
-        print("👨‍💼 إدارة المشرفين تعمل بشكل كامل")
-        print("👥 إدارة المجموعات تعمل بشكل كامل")
+        print("🚀 **بوت النشر الفعلي يعمل الآن!**")
+        print("✅ تم إصلاح جميع المشاكل:")
+        print("   🔧 النشر يعمل فعلياً")
+        print("   🔧 الردود التلقائية تعمل")
+        print("   🔧 الانضمام للمجموعات يعمل")
+        print("   ⏰ دقيقة واحدة بين كل رابط")
+        print("   ⚡ ثانية واحدة بين المجموعات في النشر")
+        print("   ✅ معالجة أخطاء Flood Wait")
+        print("   🗑️ إمكانية حذف الردود")
+        print("   🔙 أزرار الرجوع في كل مكان")
         
         self.application.run_polling()
 
-# الجزء الأخير من الكود (بعد class BotHandler):
+# الجزء الأخير من الكود
 if __name__ == "__main__":
     # بدء خادم HTTP في خيط منفصل
     http_thread = threading.Thread(target=run_health_server, daemon=True)
@@ -2292,13 +3212,13 @@ if __name__ == "__main__":
     
     # إنشاء المجلدات المطلوبة
     os.makedirs("ads", exist_ok=True)
-    os.makedirs("profile_photos", exist_ok=True)
     os.makedirs("group_replies", exist_ok=True)
+    os.makedirs("random_replies", exist_ok=True)
     
     # تشغيل البوت
     try:
         bot = BotHandler()
-        print("🤖 Starting Telegram Bot...")
+        print("🚀 Starting Telegram Bot with Fixed Publishing...")
         bot.run()
     except Exception as e:
         print(f"❌ Error: {e}")
